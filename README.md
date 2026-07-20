@@ -123,7 +123,7 @@ Full details at [veizik.com/#pricing](https://veizik.com/#pricing).
 | Plan | Price |
 | --- | --- |
 | Free Preview | $0 — install, hardware check, free entitlement, experimental render |
-| Founding Creator | **$9 / mo — checkout live** — first 100 paid subscribers, price locked 12 months |
+| Founding Creator | **$9 / month when checkout is live** — first 100 paid subscribers, price locked 12 months. Reservation (free key) is open now; no payment collected yet |
 | Pro / Studio | not currently available — opens after Preview validation |
 
 ### Founding 100
