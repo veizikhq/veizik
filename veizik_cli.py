@@ -84,6 +84,168 @@ def _packs():
     return vp
 
 
+# ---------------------------------------------------------------------------------------------------
+#   shared local state + version + honest hardware probe
+#
+#   These back `setup` / `benchmark` / `deactivate` / `update`. Two rules govern everything below:
+#     1. Never invent a number. limml_universal.probe_hardware() FALLS BACK to a synthetic
+#        "RTX 3090 / 24GB" HwProfile when torch is absent — perfectly fine for planning, fatal for a
+#        benchmark report. So benchmark uses its own probe which records WHERE each value came from
+#        and leaves anything unmeasured explicitly unmeasured.
+#     2. Never claim a render time. The native engine is not in the public download, so every
+#        render-time cell is "measurement in progress" (see _measurement_note()).
+# ---------------------------------------------------------------------------------------------------
+_UNMEASURED = "measurement in progress"
+
+# Kept in sync with web/install.sh (VZ_REPO / VZ_HOME); overridable for private mirrors.
+_INSTALL_URL = os.environ.get("VEIZIK_INSTALL_URL", "https://veizik.com/install.sh")
+_VZ_REPO = os.environ.get("VZ_REPO", "https://github.com/veizikhq/veizik.git")
+_VZ_HOME = os.path.expanduser(os.environ.get("VZ_HOME", "~/.veizik/app"))
+
+
+def _app_version():
+    """(version, source). 'unknown' is a legitimate answer — better than a made-up number."""
+    env = os.environ.get("VEIZIK_VERSION")
+    if env:
+        return env.strip(), "VEIZIK_VERSION"
+    for cand in (os.path.join(_HERE, "VERSION"),
+                 os.path.abspath(os.path.join(_HERE, "..", "VERSION")),
+                 os.path.abspath(os.path.join(_HERE, "..", "..", "VERSION")),
+                 os.path.join(_VZ_HOME, "VERSION")):
+        try:
+            with open(cand) as f:
+                v = f.read().strip()
+            if v:
+                return v, cand
+        except OSError:
+            continue
+    # a git checkout of the distribution repo can describe itself
+    if os.path.isdir(os.path.join(_VZ_HOME, ".git")):
+        try:
+            r = subprocess.run(["git", "-C", _VZ_HOME, "describe", "--tags", "--always"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip(), "git describe (%s)" % _VZ_HOME
+        except Exception:
+            pass
+    return "unknown", "no VERSION file found"
+
+
+def _run_out(cmd, timeout=10):
+    """Best-effort stdout of a helper binary. Never raises; missing tool -> None."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _probe_hw_honest():
+    """Hardware facts with provenance. Every field carries how it was obtained, and anything we
+    could not read stays None instead of being defaulted. Pure stdlib except an optional torch peek."""
+    import platform
+    hw = {"os": "%s %s" % (platform.system(), platform.release()),
+          "os_major": "%s-%s" % (platform.system().lower(), (platform.release() or "?").split(".")[0]),
+          "arch": platform.machine(), "python": platform.python_version(),
+          "cpu_count": os.cpu_count(), "sources": {}}
+    hw["sources"]["os"] = "platform"
+
+    try:
+        hw["ram_gb"] = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
+        hw["sources"]["ram_gb"] = "sysconf"
+    except Exception:
+        hw["ram_gb"] = None
+
+    # --- NVIDIA: nvidia-smi is authoritative and needs no python packages -------------------------
+    out = _run_out(["nvidia-smi",
+                    "--query-gpu=name,memory.total,memory.free,driver_version,compute_cap",
+                    "--format=csv,noheader,nounits"])
+    gpus = []
+    if out:
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            def _f(x):
+                try: return float(x)
+                except ValueError: return None
+            tot, free = _f(parts[1]), _f(parts[2])
+            gpus.append({"name": parts[0],
+                         "vram_total_gb": round(tot / 1024.0, 2) if tot is not None else None,
+                         "vram_free_gb": round(free / 1024.0, 2) if free is not None else None,
+                         "driver": parts[3],
+                         "compute_cap": parts[4] if len(parts) > 4 else None})
+    if gpus:
+        hw["gpu_vendor"] = "nvidia"
+        hw["gpus"] = gpus
+        hw["sources"]["gpu"] = "nvidia-smi"
+        cu = _run_out(["nvidia-smi", "--query", "--display=COMPUTE"]) or ""
+        for ln in cu.splitlines():
+            if "CUDA Version" in ln:
+                hw["cuda_version"] = ln.split(":", 1)[1].strip()
+                hw["sources"]["cuda_version"] = "nvidia-smi"
+                break
+
+    # --- torch peek: confirms the runtime can actually SEE the GPU (a driver is not enough) -------
+    try:
+        import torch
+        hw["torch"] = torch.__version__
+        hw["sources"]["torch"] = "import torch"
+        if torch.cuda.is_available():
+            hw["accel"] = "cuda"
+            hw["cuda_version"] = hw.get("cuda_version") or (torch.version.cuda or None)
+            hw["gpu_count"] = torch.cuda.device_count()
+            if not gpus:                              # driver hidden (WSL/container) but torch sees it
+                props = torch.cuda.get_device_properties(0)
+                hw["gpu_vendor"] = "nvidia"
+                hw["gpus"] = [{"name": props.name,
+                               "vram_total_gb": round(props.total_memory / 1e9, 2),
+                               "vram_free_gb": None, "driver": None,
+                               "compute_cap": "%d.%d" % (props.major, props.minor)}]
+                hw["sources"]["gpu"] = "torch.cuda"
+        elif getattr(getattr(torch, "backends", None), "mps", None) is not None \
+                and torch.backends.mps.is_available():
+            hw["accel"] = "mps"                        # Apple Silicon: not a supported render target
+            hw["gpu_vendor"] = "apple"
+        else:
+            hw["accel"] = "cpu"
+    except Exception as e:
+        hw["torch"] = None
+        hw["torch_error"] = "%s: %s" % (type(e).__name__, e)
+        hw["accel"] = "cuda" if gpus else "none"       # a driver exists, but nothing can drive it here
+
+    hw["gpu_count"] = hw.get("gpu_count") or len(hw.get("gpus") or [])
+    return hw
+
+
+def _tier_verdict(hw):
+    """What this machine can run TODAY, in the public download. Honest about the gap between
+    'the engine supports it' and 'the engine is downloadable'."""
+    gpus = hw.get("gpus") or []
+    if hw.get("gpu_vendor") == "nvidia" and gpus:
+        cc = (gpus[0].get("compute_cap") or "0").split(".")
+        try:
+            sm = int(cc[0]) * 10 + int(cc[1])
+        except (ValueError, IndexError):
+            sm = 0
+        if hw.get("accel") != "cuda":
+            return ("T3", "an NVIDIA driver is present but no CUDA-capable torch is installed here — "
+                          "install torch to reach the universal path")
+        levers = []
+        if sm >= 89:
+            levers.append("fp8 tensor cores")
+        if sm >= 75:
+            levers.append("int8 tensor cores")
+        return ("T2", "universal path available (torch %s, CUDA %s)%s. T1 native-CUDA needs the "
+                      "native engine pack, which is NOT published yet."
+                % (hw.get("torch"), hw.get("cuda_version") or "?",
+                   "; hardware also has " + " + ".join(levers) if levers else ""))
+    if hw.get("accel") == "mps":
+        return ("T3", "Apple Silicon (MPS). The experimental universal t2v/t2i path is Linux + NVIDIA "
+                      "only; doctor/license/telemetry/pack all work here.")
+    return ("T3", "no CUDA GPU detected — doctor/license/telemetry/pack work, rendering does not.")
+
+
 def _gate_paid(feature, label):
     """Gate a paid-only feature (TimeMachine branch/fanout). Returns None if allowed, else prints an
     upgrade notice and returns an exit code. Free/entry tiers don't get these."""
@@ -93,7 +255,231 @@ def _gate_paid(feature, label):
         return None
     print("\n[license] %s requires a paid plan (Creator+). Current: %s." % (label, ent.label()))
     print("[license] upgrade at https://veizik.com  —  then:  veizik login <api_key>")
+    # §14: a refused TimeMachine attempt is exactly the moment the Pro Preview path is worth showing
+    # (once a day, and never claiming the command runs in this build).
+    _usage_note(event="pro_attempt", feature="timemachine")
     return 3  # distinct 'not entitled' code (non-crashing)
+
+
+# ---------------------------------------------------------------------------------------------------
+#   §14  usage-behaviour upsell — one hint, only at the moment it is useful.
+#
+#   This is deliberately NOT advertising: every line is triggered by something the user just did, so
+#   it reads as the next step rather than a pitch. The rules that keep it from becoming spam:
+#     - at most ONE hint per command invocation (never a stack of suggestions)
+#     - the same hint is printed at most once per calendar day
+#     - VEIZIK_NO_HINTS=1 silences all of them (scripts, CI, screen recordings)
+#     - nothing here may claim an unshipped feature works. Every Pro-Preview line prints the real
+#       lifecycle stage from _FEATURES and says plainly that the command is not in this download.
+#
+#   State: ~/.veizik/usage.json. Local only — this file is never uploaded by this module, and it is
+#   separate from veizik_telemetry's telemetry_state.json (that one is the CONSENTED channel and only
+#   moves under the allowlist). Keeping them apart means the funnel keeps working for a user who
+#   declined telemetry, which §5 requires.
+# ---------------------------------------------------------------------------------------------------
+_VEIZIK_HOME = os.path.expanduser(os.environ.get("VEIZIK_HOME", "~/.veizik"))
+_USAGE_PATH = os.path.join(_VEIZIK_HOME, "usage.json")
+
+
+def _iso_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _usage_load():
+    """Read usage.json. Any corruption reads as 'no history' — a bad state file must never be able to
+    break a command, at worst it re-shows a hint."""
+    try:
+        with open(_USAGE_PATH) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def _usage_save(st):
+    """Atomic-ish write, 0700 dir (it records what this machine did). Never raises."""
+    try:
+        os.makedirs(_VEIZIK_HOME, exist_ok=True)
+        try:
+            os.chmod(_VEIZIK_HOME, 0o700)
+        except OSError:
+            pass
+        tmp = _USAGE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2, sort_keys=True)
+        os.replace(tmp, _USAGE_PATH)
+    except Exception:
+        pass  # bookkeeping is never allowed to fail a render
+    return st
+
+
+def _mark_activated():
+    """`veizik activate/login` succeeded on this machine."""
+    st = _usage_load()
+    st.setdefault("activated_at", _iso_now())
+    st["last_activate_at"] = _iso_now()
+    return _usage_save(st)
+
+
+def _mark_doctor_ok():
+    """`veizik doctor` ran to completion (it probed the hardware and printed the tier table)."""
+    st = _usage_load()
+    st.setdefault("doctor_ok_at", _iso_now())
+    st["doctor_runs"] = int(st.get("doctor_runs") or 0) + 1
+    return _usage_save(st)
+
+
+def _mark_render_success():
+    """Count a render that actually produced a file. Returns the new cumulative count.
+
+    The first one also pings the server (see _report_first_success): §2 puts the start of the 7-day
+    Starter clock at the FIRST SUCCESSFUL RENDER, not at activation, so install/driver trouble never
+    burns trial time — but only the server can hold that clock."""
+    st = _usage_load()
+    n = int(st.get("render_successes") or 0) + 1
+    st["render_successes"] = n
+    if not st.get("first_success_at"):
+        st["first_success_at"] = _iso_now()
+    st["last_success_at"] = _iso_now()
+    _usage_save(st)
+    if not st.get("first_success_reported"):
+        _report_first_success(st)
+    return n
+
+
+# The endpoint may legitimately not exist yet on a given deployment; cap the retries so an
+# unreachable/404 server cannot add a network round-trip to every render forever.
+_FIRST_SUCCESS_MAX_TRIES = 5
+
+
+def _report_first_success(st):
+    """POST /api/trial/first-success — best effort, and silent by design.
+
+    Offline laptop, captive portal, blocked egress, 404, a server that has not shipped this route:
+    all of them are no-ops here. It is retried on later successful renders until acknowledged (capped)
+    so a machine that rendered while offline still gets its trial start recorded.
+
+    Body carries the pseudonymous installation id and the timestamp only — no prompt, no input file,
+    no output path, no hostname. That matches what §5 step 1 says license operation transmits."""
+    tries = int(st.get("first_success_tries") or 0)
+    if tries >= _FIRST_SUCCESS_MAX_TRIES:
+        return
+    body = {"occurred_at": st.get("first_success_at"), "event": "first_render_success"}
+    base = os.environ.get("VEIZIK_API_BASE", "https://veizik.com").rstrip("/")
+    try:
+        vt = _tel()
+        body["installation_id"] = vt.installation_id()   # same pseudonymous id the license flow uses
+    except Exception:
+        pass
+    try:
+        ve = _ent()
+        base = ve.API_BASE
+        # session accessor is module-private in some builds; absence just means "not logged in"
+        _ls = getattr(ve, "load_session", None) or getattr(ve, "_load_session", None)
+        sess = _ls() if _ls else None
+        if sess and sess.get("api_key"):
+            body["api_key"] = sess["api_key"]
+    except Exception:
+        pass
+
+    st["first_success_tries"] = tries + 1
+    _usage_save(st)
+    try:
+        import urllib.request as _u
+        req = _u.Request(base + "/api/trial/first-success", data=json.dumps(body).encode(),
+                         headers={"Content-Type": "application/json",
+                                  "User-Agent": "veizik-cli/1.0 (+https://veizik.com)"},
+                         method="POST")
+        with _u.urlopen(req, timeout=6) as r:
+            ok = 200 <= int(getattr(r, "status", None) or r.getcode()) < 300
+            r.read()
+    except Exception:
+        return  # ignored, exactly as specified
+    if ok:
+        st["first_success_reported"] = True
+        _usage_save(st)
+
+
+def _pick_hint(st, event, feature):
+    """Choose the single most relevant hint, or None. Order is 'what is the user blocked on right
+    now', most specific first — an explicit Pro-Preview attempt beats any funnel-stage nudge."""
+    successes = int(st.get("render_successes") or 0)
+
+    # (a) they just typed a command that only exists in the Pro Preview track.
+    if event == "pro_attempt" and feature:
+        stage, plans, _desc, caveat = _FEATURES.get(
+            feature, ("Development", ["pro"], feature, "not shipped in the public download"))
+        return ("pro_preview:" + feature, [
+            "  `veizik %s` is available in Pro Preview — Founding Pro Runtime Pass" % feature,
+            "  ($249-299 first year: 3 registered devices, 2 concurrent nodes, advanced FP8/INT8,",
+            "  Queue/batch, advanced GPU Oracle, Pro Preview channel for 24 months).",
+            "  Status: %s — %s." % (stage, caveat),
+            "  Upgrading does NOT make this command run today; Pro simply gets it first when it",
+            "  ships.   Detail:  veizik feature %s      https://veizik.com/#pricing" % feature,
+        ])
+
+    # (b) activated but never ran doctor -> the install is not actually finished.
+    if st.get("activated_at") and not st.get("doctor_ok_at"):
+        return ("next_doctor", [
+            "  Next step — check what this machine can run (GPU, VRAM, per-family support tier):",
+            "      veizik doctor",
+        ])
+
+    # (c) doctor passed, nothing rendered yet -> hand them the exact command, honestly labelled.
+    if st.get("doctor_ok_at") and successes == 0:
+        return ("next_sample", [
+            "  Nothing has been rendered on this machine yet. Try a sample:",
+            '      veizik t2i "a red apple on a worn oak table, morning light" --steps 20',
+            "  (universal path, experimental: Linux + NVIDIA, using your own torch / diffusers)",
+        ])
+
+    # (d) the first successful render — the one moment the offer is genuinely earned.
+    if successes == 1:
+        return ("founder_offer", [
+            "  This machine completed its first Veizik render.",
+            "  Founding Creator — $9 monthly / $79 annual: commercial output, watermark removal,",
+            "  stable profiles, Creator Adapters + Capsules, automatic updates.",
+            "      https://veizik.com/#pricing     then:  veizik activate <YOUR_KEY>",
+        ])
+
+    # (e) a repeat user — annual is simply the cheaper shape, and Pro interest is worth registering.
+    if successes >= 3:
+        return ("repeat_user", [
+            "  %d successful renders on this machine." % successes,
+            "  $79 annual costs less than 9 months at $9 — https://veizik.com/#pricing",
+            "  Want Queue/batch, advanced FP8/INT8, Recover or TimeMachine? Register interest with",
+            "      veizik upgrade pro",
+            "  (those are Development / Private Preview — not shipped in the public download yet).",
+        ])
+    return None
+
+
+def _usage_note(event=None, feature=None):
+    """Print AT MOST ONE situational hint for the command that just ran (§14).
+
+    Call it at the END of a successful command path only — a hint after a failure reads as noise.
+    Same-hint-once-per-day is enforced here, so callers never have to think about repetition."""
+    if os.environ.get("VEIZIK_NO_HINTS") == "1":
+        return 0
+    try:
+        st = _usage_load()
+        hit = _pick_hint(st, event, feature)
+        if not hit:
+            return 0
+        hint_id, lines = hit
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        shown = dict(st.get("hints_shown") or {})
+        if shown.get(hint_id) == today:
+            return 0            # already said this today; say nothing rather than repeat
+        shown[hint_id] = today
+        st["hints_shown"] = shown
+        _usage_save(st)
+        print("")
+        for ln in lines:
+            print(ln)
+    except Exception:
+        pass  # a hint is never worth an error
+    return 0
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -112,6 +498,9 @@ def cmd_login(args):
     # First activation on this machine -> show the two-step consent screens exactly once.
     # Declining step 2 changes nothing about what you just bought.
     _consent_flow()
+    # §14: an activated machine that has never run `doctor` is a half-finished install.
+    _mark_activated()
+    _usage_note()
     return 0
 
 
@@ -127,7 +516,54 @@ def cmd_activate(args):
 #     step 2: optional performance/compatibility data -> a real Yes/No, both of which proceed.
 #   Declining step 2 NEVER locks a purchased feature (GDPR Art.7(4) / Korea PIPA).
 # ---------------------------------------------------------------------------------------------------
+_RULE = "-" * 78
+
+
+def _license_gate_is_telemetry_free():
+    """Runtime PROOF of the promise the consent screen makes: declining optional telemetry
+    cannot lock a purchased feature.
+
+    We do not merely assert this in prose. Every feature gate in this CLI (`_gate_paid`,
+    `ent.allows`, `ent.clamp`, `ent.stamp`) reads the signed entitlement payload and nothing
+    else, so the check is mechanical: the license module must never reference the telemetry
+    module. If a future edit wires consent into the gate, this flips to False and the CLI stops
+    printing the guarantee instead of printing a lie.
+
+    Returns (ok, detail).
+    """
+    try:
+        import veizik_entitlement as _ve
+        src = open(_ve.__file__, "r", encoding="utf-8", errors="replace").read().lower()
+    except Exception as e:
+        return None, "could not inspect the license module (%s)" % type(e).__name__
+    if "telemetry" in src:
+        return False, "the license module references telemetry — the guarantee is NOT verified"
+    return True, "verified at runtime: the license gate never reads your telemetry choice"
+
+
+def _print_consent_step(step, index, total):
+    """Render one screen of the spec §5 flow. Copy comes from veizik_telemetry so the CLI and
+    any future GUI cannot drift apart in wording."""
+    print("\n" + _RULE)
+    print(" Step %d of %d   %s" % (index, total, step["title"]))
+    print(_RULE)
+    for para in step.get("body", []):
+        print("  %s" % para)
+    for item in step.get("items", []):
+        print("    - %s" % item)
+    if step.get("assurance"):
+        print("\n  %s" % step["assurance"])
+
+
 def _consent_flow(force=False):
+    """First-run consent — TWO screens, shown in order, never merged into one checkbox.
+
+    Screen 1 is a notice ([Continue] only): license operation data is what makes the licensed
+    product function, so pretending it is optional would be dishonest.
+    Screen 2 is the real, separable choice. BOTH answers continue, and No is a first-class
+    outcome: no feature is gated on it anywhere in this codebase (see
+    _license_gate_is_telemetry_free, which checks that rather than claiming it).
+    """
     try:
         vt = _tel()
     except Exception as e:
@@ -136,49 +572,113 @@ def _consent_flow(force=False):
     if vt.consent_asked() and not force:
         return 0
 
-    print("\n" + "-" * 78)
-    print(" 1/2  License operating data — required to run veizik")
-    print("-" * 78)
-    print("  To validate your license and your concurrent-node lease, veizik processes:")
-    print("    - license id / hash")
-    print("    - a PSEUDONYMOUS device identifier (a local random id, hashed; not your")
-    print("      hostname, MAC address or user name)")
-    print("    - your plan, app + protocol version, activation state, last verification time,")
-    print("      run lease and expiry, subscription state")
-    print("  This is the minimum needed to deliver the product you licensed, so it is not")
-    print("  optional and is not used for analytics or marketing.")
-    try:
-        input("\n  Press Enter to continue... ")
-    except EOFError:
-        print("\n  (non-interactive) continuing.")
+    copy = vt.consent_screen_text()
+    step1, step2 = copy["step_1"], copy["step_2"]
+    interactive = sys.stdin.isatty()
 
-    print("\n" + "-" * 78)
-    print(" 2/2  Optional: performance & compatibility data")
-    print("-" * 78)
-    print("  Separate and entirely optional. It helps us tune VRAM planning and GPU support:")
-    for name, detail in vt.COLLECTED:
-        print("    %-16s %s" % (name + ":", detail))
-    print("\n  Never collected:")
-    print("    " + "; ".join(vt.NEVER_COLLECTED))
+    # ---- 1/2  Veizik license operation  → [Continue] ----
+    _print_consent_step(step1, 1, 2)
+    if interactive:
+        try:
+            input("\n  [Continue] press Enter... ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+
+    # ---- 2/2  Help improve hardware compatibility → Yes / No, both proceed ----
+    _print_consent_step(step2, 2, 2)
+    print("\n  You stay in control of this at any time:")
+    for line in step2.get("commands", []):
+        print("    %s" % line)
     print("\n  %s" % vt.retention_note())
-    print("  Saying No changes NOTHING about the features on your plan. You can change this")
-    print("  any time with `veizik telemetry enable` / `veizik telemetry disable`.")
+    print("\n  %s" % step2["no_lockout"])
+
+    yes_label, no_label = step2["actions"][0], step2["actions"][1]
+    if not interactive:
+        # No terminal to answer with. We do NOT record a decision here: silence is not consent,
+        # and recording "asked" would rob the user of ever seeing the real screen. Sharing stays
+        # off, and the flow will run again on the next interactive invocation.
+        print("\n  [%s] / [%s]" % (yes_label, no_label))
+        print("  No answer recorded (not an interactive terminal). Sharing stays OFF until you")
+        print("  choose. Decide any time with `veizik telemetry enable` / `veizik telemetry disable`.")
+        print(_RULE)
+        return 0
+
+    print("\n    [1] %s" % yes_label)
+    print("    [2] %s   (default)" % no_label)
     ans = ""
     try:
-        ans = input("\n  Share optional performance data? [y/N] ").strip().lower()
-    except EOFError:
+        ans = input("\n  Choose [1/2]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
         ans = ""
-    yes = ans in ("y", "yes")
+    yes = ans in ("1", "y", "yes")
+
     vt.set_consent(yes)
-    print("  -> optional performance telemetry %s (consent version %s)"
-          % ("ENABLED — thank you" if yes else "DISABLED", vt.CONSENT_VERSION))
-    print("-" * 78)
+    print("\n" + _RULE)
+    if yes:
+        print("  Sharing performance data: ON  (consent version %s). Thank you." % vt.CONSENT_VERSION)
+        _apply_contributor_benefits(vt)
+    else:
+        print("  Sharing performance data: OFF  (consent version %s)." % vt.CONSENT_VERSION)
+        print("  Nothing is locked. %s" % step2["no_lockout"])
+        ok, detail = _license_gate_is_telemetry_free()
+        if ok:
+            print("  %s" % detail)
+        elif ok is False:
+            print("  WARNING: %s" % detail)
+    print(_RULE)
     return 0
+
+
+def _apply_contributor_benefits(vt):
+    """Grant the §6 benefits for consenting. Local record first (so it holds offline), server
+    sync on a daemon thread. Any failure is silent by design — a benefit that fails to sync must
+    never turn into an error the user has to deal with mid-render."""
+    try:
+        grant = vt.grant_contributor_benefits()
+    except Exception:
+        return
+    if grant.get("granted_at"):
+        print("  Granted: Starter Preview +%d days, plus the contributor benefits below."
+              % grant.get("trial_extension_days", 3))
+    print("  See them all:  veizik telemetry benefits")
+    print("  Your report:   veizik telemetry contributor")
+
+
+def _contributor_hardware():
+    """Flatten _probe_hw_honest() into the display shape the contributor report prints.
+
+    Anything we could not read stays absent rather than being defaulted to a plausible value —
+    an unknown GPU printed as a guess is exactly the class of fake number this report exists to
+    avoid."""
+    hw = _probe_hw_honest()
+    gpus = hw.get("gpus") or []
+    out = {}
+    if gpus:
+        out["gpu"] = gpus[0].get("name")
+        if gpus[0].get("vram_total_gb") is not None:
+            out["vram_gb"] = "%.1f" % gpus[0]["vram_total_gb"]
+        if gpus[0].get("driver"):
+            out["driver"] = gpus[0]["driver"]
+    if hw.get("gpu_count"):
+        out["gpu_count"] = hw["gpu_count"]
+    if hw.get("cuda_version"):
+        out["cuda"] = hw["cuda_version"]
+    out["os"] = hw.get("os")
+    if hw.get("cpu_count"):
+        out["cpu"] = "%s cores (%s)" % (hw["cpu_count"], hw.get("arch") or "?")
+    if hw.get("ram_gb"):
+        out["ram_gb"] = hw["ram_gb"]
+    ver, _src = _app_version()
+    out["runtime"] = "veizik %s / python %s%s" % (
+        ver, hw.get("python") or "?",
+        (" / torch %s" % hw["torch"]) if hw.get("torch") else " / torch not installed")
+    return out
 
 
 def cmd_status(args):
     ve = _ent()
     print("[status] %s" % ve.status_line(ve.resolve()))
+    _usage_note()   # §14: status is where a stuck user looks; give them the one next step
     return 0
 
 
@@ -338,6 +838,9 @@ def cmd_doctor(args):
     print("         + LimML capacity-compute offload+tiling+TeaCache. T3=whole-model offload+SDPA,")
     print("         no advanced levers but STILL RENDERS. Any unknown model -> T3 (swap never rejected).")
     print("\n[drop-in] alias comfy=veizik works: `comfy run wf.json` and `comfy launch` are supported.")
+    # §14: doctor completed -> if they have never rendered, the next step is a sample command.
+    _mark_doctor_ok()
+    _usage_note()
     return 0
 
 
@@ -450,6 +953,10 @@ def cmd_run(args):
     if rc == 0:
         print("\n[run] OK -> %s" % out_path)
         ve.stamp(out_path, ent, intent.get("is_video", False))
+        # §14: a render that produced a file is the signal — count it, ping the trial clock on the
+        # very first one, then show at most one hint (Founder offer / annual+Pro).
+        _mark_render_success()
+        _usage_note()
     else:
         # Even a render backend miss must NOT read as a swap rejection. Fall back to passthrough.
         print("\n[run] native/universal render unavailable on this host (%s); falling back to "
@@ -561,6 +1068,9 @@ def _cmd_direct(args, is_video):
     if rc == 0:
         print("\n[%s] OK -> %s" % ("t2v" if is_video else "t2i", out))
         ve.stamp(out, ent, is_video)     # tier watermark (forced/weak -> visible+metadata; none -> metadata)
+        # §14: same success signal as `veizik run` — only a real written file counts.
+        _mark_render_success()
+        _usage_note()
         return 0
     print("\n[%s] render backend unavailable on this host (%s). Plan is valid; run on the render host"
           " (see docstring) to produce the file." % ("t2v" if is_video else "t2i", rc))
@@ -1426,12 +1936,60 @@ def cmd_telemetry(args):
             print("  [x] %s" % item)
         print("\n%s" % vt.retention_note())
         print("Declining telemetry never disables anything on your plan.")
+        ok, detail = _license_gate_is_telemetry_free()
+        if ok:
+            print("(%s)" % detail)
+        elif ok is False:
+            print("WARNING: %s" % detail)
+
+        # §6 — what sharing buys. Shown to everyone: someone who declined is entitled to know
+        # exactly what they are declining, and someone who consented is entitled to see that they
+        # actually got it.
+        print("\n" + vt.benefits_text())
+        g = vt.contributor_grant()
+        if g.get("granted_at"):
+            print("\nYour grant: Starter Preview +%s days, recorded %s (server sync: %s)."
+                  % (g.get("trial_extension_days", vt.TRIAL_EXTENSION_DAYS), g["granted_at"],
+                     "confirmed" if g.get("server_synced") else "pending"))
+        elif not on:
+            print("\nTurn sharing on to claim these:  veizik telemetry enable")
+        print("Your own report:  veizik telemetry contributor")
         return 0
+
+    if act == "benefits":
+        print("\n" + vt.benefits_text())
+        g = vt.contributor_grant()
+        if g.get("granted_at"):
+            print("\nGranted on this machine: Starter Preview +%s days (%s, server sync: %s)."
+                  % (g.get("trial_extension_days", vt.TRIAL_EXTENSION_DAYS), g["granted_at"],
+                     "confirmed" if g.get("server_synced") else "pending"))
+        elif not vt.enabled():
+            print("\nNot claimed yet on this machine:  veizik telemetry enable")
+        print("\nSee your own numbers:  veizik telemetry contributor")
+        return 0
+
+    if act == "contributor":
+        # Hardware is probed HERE and passed in, so veizik_telemetry stays stdlib-only and never
+        # imports the engine (a doctor-less, torch-less host must still print this report).
+        hw = {}
+        try:
+            hw = _contributor_hardware()
+        except Exception:
+            hw = {}
+        print("\n" + vt.contributor_report_text(hw))
+        if not vt.enabled():
+            print("\n(Sharing is OFF. The figures above are local-only and were never transmitted.)")
+        return 0
+
+    if act == "consent":
+        # Re-show the two-step §5 flow on demand, e.g. to change your mind or to read it again.
+        return _consent_flow(force=True)
 
     if act == "enable":
         vt.set_consent(True)
         print("[telemetry] performance data ENABLED (consent version %s)." % vt.CONSENT_VERSION)
         print("[telemetry] see exactly what is sent:  veizik telemetry status")
+        _apply_contributor_benefits(vt)
         return 0
 
     if act == "disable":
@@ -1472,30 +2030,51 @@ def cmd_telemetry(args):
             return 0
         print("[telemetry] %d pending report(s), %.1f KB:" % (len(items), vt.queue_bytes() / 1024.0))
         for it in items:
-            r = it.get("result") or {}
-            wl = it.get("workload") or {}
+            # _spool_read() yields {"file": ..., "report": {...}} — the run report is NESTED.
+            # Reading the fields off the wrapper printed a table of "-" for every column.
+            rep = it.get("report") or {}
+            r = rep.get("result") or {}
+            wl = rep.get("workload") or {}
             print("  %-20s %-10s %sx%s %ssteps  %-8s wall=%ss peak=%sGB"
-                  % (it.get("event_id", "")[:20], wl.get("model_public_id", "-"),
+                  % (str(rep.get("event_id", ""))[:20], wl.get("model_public_id", "-"),
                      wl.get("width", "-"), wl.get("height", "-"), wl.get("steps", "-"),
                      r.get("status", "-"), r.get("wall_s", "-"), r.get("peak_vram_gb", "-")))
         return 0
 
     if act == "send":
-        n, msg = vt.send(force=getattr(args, "force", False))
-        print("[telemetry] %s" % msg)
+        # send() returns a bool ("did a batch flush cleanly"), not (n, msg). Unpacking it raised
+        # TypeError and made `veizik telemetry send` fail outright.
+        pending = vt.queue_count()
+        ok = vt.send(force=getattr(args, "force", False))
+        if ok:
+            print("[telemetry] uploaded %d report(s); the local queue now holds %d."
+                  % (pending - vt.queue_count(), vt.queue_count()))
+        elif not pending:
+            print("[telemetry] nothing queued to send.")
+        elif not vt.enabled():
+            print("[telemetry] sharing is disabled — %d report(s) held locally, none sent." % pending)
+        else:
+            print("[telemetry] not sent (endpoint unreachable, or the 24h batch window is not open "
+                  "yet — use `--force`). %d report(s) still queued; your renders are unaffected."
+                  % pending)
         return 0
 
     if act == "export":
         out = getattr(args, "out", None) or "veizik_telemetry_export.json"
-        n = vt.export(out)
-        print("[telemetry] exported %d pending report(s) -> %s" % (n, os.path.abspath(out)))
+        n = vt.queue_count()
+        path = vt.export(out)          # returns the written path, or None on failure
+        if not path:
+            print("[telemetry] export failed (could not write %s)." % os.path.abspath(out))
+            return 1
+        print("[telemetry] exported consent, status, local state and %d pending report(s) -> %s"
+              % (n, path))
         print("[telemetry] this is byte-for-byte what would be uploaded.")
         return 0
 
     if act == "delete":
-        n, msg = vt.delete_request()
-        print("[telemetry] removed %d locally queued report(s)." % n)
-        print("[telemetry] %s" % msg)
+        res = vt.delete_request()      # returns a dict, not (n, msg)
+        print("[telemetry] removed %d locally queued report(s)." % res.get("local_purged", 0))
+        print("[telemetry] %s" % res.get("message", ""))
         return 0
 
     print("[telemetry] unknown action: %s" % act)
@@ -1712,6 +2291,52 @@ def cmd_upgrade(args):
     print("\n(Payment is handled by Polar as merchant of record. veizik never opens a browser for")
     print("you and never takes card details in the terminal.)")
     return 0
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik queue | batch | recover | api | timemachine  (§14, last bullet)
+#
+#   None of these run in the public download. They exist in the grammar anyway, because a user who
+#   types `veizik queue` deserves a real answer — stage, "not in this build", which plan gets it
+#   first — instead of argparse's "invalid choice". This handler prints the FACTS every time; the
+#   upgrade path is the one-per-day hint from _usage_note, so repeated attempts don't nag.
+#
+#   Honesty rule for this whole block: never imply that buying Pro makes the command work today.
+# ---------------------------------------------------------------------------------------------------
+_PRO_PREVIEW_CMDS = ("queue", "batch", "recover", "api", "timemachine")
+
+
+def cmd_pro_preview(args):
+    name = getattr(args, "preview_feature", "") or ""
+    stage, plans, desc, caveat = _FEATURES.get(
+        name, ("Development", ["pro"], name, "not shipped in the public download"))
+    print("\n%s — %s" % (name, desc))
+    print("  Stage           %s   (%s)" % (stage, " < ".join(_STAGES)))
+    print("  In this build   NO — `veizik %s` is not implemented in the public download." % name)
+    print("  Reality check   %s" % caveat)
+    print("  Available on    %s" % ", ".join(_PLAN_NAME.get(p, p) for p in plans))
+
+    tier = "free"
+    try:
+        ent = _ent().resolve(quiet=True)
+        tier = ent.tier
+        print("  Your plan       %s" % ent.label())
+    except Exception:
+        print("  Your plan       (no license session; run `veizik status`)")
+    covered = {"free": "starter", "personal": "starter", "creator": "creator",
+               "pro": "pro", "studio": "studio"}.get(tier, "starter") in plans
+
+    if covered:
+        # Already on a plan that includes it. There is nothing to sell — say so, and don't pretend
+        # the command became runnable.
+        print("\n  Your plan already covers %s for when it ships, through the Pro Preview channel." % name)
+        print("  Nothing to buy. Watch the stage with:  veizik feature %s" % name)
+    else:
+        _usage_note(event="pro_attempt", feature=name)
+    print("\n%s" % _measurement_note())
+    # 3 = "this command did no work on this plan/build" — the same non-crashing code _gate_paid uses,
+    # so a script can distinguish it from a real failure.
+    return 3
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2014,6 +2639,669 @@ def cmd_pack(args):
 
 
 # ---------------------------------------------------------------------------------------------------
+#   veizik setup — first-run onboarding.
+#
+#   One command that walks the whole first five minutes: what this machine can run, the TWO-SCREEN
+#   consent (§5), how to get a key if you don't have one, and the next command to type. Re-running it
+#   after setup is a status summary rather than a wizard, so it is always safe to type.
+# ---------------------------------------------------------------------------------------------------
+def _hw_summary_lines(hw, tier, verdict):
+    """Compact, provenance-honest hardware lines shared by setup and benchmark."""
+    lines = []
+    gpus = hw.get("gpus") or []
+    if gpus:
+        for i, g in enumerate(gpus):
+            vram = ("%.1f GB" % g["vram_total_gb"]) if g.get("vram_total_gb") is not None else "unknown"
+            free = ("%.1f GB free" % g["vram_free_gb"]) if g.get("vram_free_gb") is not None else "free unknown"
+            lines.append("  GPU %d           %s | %s | %s | cc %s | driver %s"
+                         % (i, g.get("name") or "unknown", vram, free,
+                            g.get("compute_cap") or "?", g.get("driver") or "?"))
+    else:
+        lines.append("  GPU             none detected (nvidia-smi absent or no NVIDIA device)")
+    lines.append("  accelerator     %s" % (hw.get("accel") or "none"))
+    lines.append("  torch           %s" % (hw.get("torch") or "not installed — the render path needs it"))
+    if hw.get("cuda_version"):
+        lines.append("  CUDA            %s" % hw["cuda_version"])
+    lines.append("  OS / arch       %s / %s   (python %s)" % (hw.get("os"), hw.get("arch"), hw.get("python")))
+    lines.append("  host RAM        %s" % (("%.0f GB" % hw["ram_gb"]) if hw.get("ram_gb") else "unknown"))
+    lines.append("  support tier    %s — %s" % (tier, verdict))
+    return lines
+
+
+def cmd_setup(args):
+    _banner()
+    st = _usage_load()
+    configured = False
+    try:
+        configured = bool(_tel().consent_asked())
+    except Exception:
+        pass
+
+    ve = _ent()
+    try:
+        ent = ve.resolve(quiet=True)
+    except Exception:
+        ent = None
+    has_key = bool(ent is not None and ent.source != "free")
+
+    # ---- already set up: summarise instead of re-running the wizard --------------------------------
+    if configured and not args.force:
+        print("\nThis machine is already set up.\n")
+        print("  licence         %s" % (ve.status_line(ent) if ent is not None else "unknown"))
+        try:
+            vt = _tel()
+            print("  telemetry       %s (consent %s)"
+                  % ("enabled" if vt.enabled() else "disabled",
+                     (vt.consent_state() or {}).get("consent_version") or "-"))
+            print("  install id      %s   (pseudonymous)" % vt.installation_id())
+        except Exception as e:
+            print("  telemetry       unavailable (%s)" % type(e).__name__)
+        print("  first render    %s" % (st.get("first_success_at") or "not yet"))
+        print("  renders         %d successful on this machine" % int(st.get("render_successes") or 0))
+        print("  app version     %s" % _app_version()[0])
+        print("\nRe-run the consent screens with:  veizik setup --force")
+        print("Hardware detail:                 veizik doctor")
+        _usage_note()
+        return 0
+
+    # ---- 1. what this machine is -----------------------------------------------------------------
+    # NOTE: no "step 1 of 3" numbering here. _consent_flow() prints its own mandatory "Step 1 of 2 /
+    # Step 2 of 2" screens (§5) and two nested counters read as a broken wizard.
+    print("\n== This machine " + "=" * 61 + "\n")
+    hw = _probe_hw_honest()
+    tier, verdict = _tier_verdict(hw)
+    for ln in _hw_summary_lines(hw, tier, verdict):
+        print(ln)
+    print("\n  Full per-family table:  veizik doctor")
+    print("  %s" % _measurement_note())
+
+    # ---- 2. consent, two separate screens (§5) ----------------------------------------------------
+    print("\n== What veizik processes " + "=" * 52 + "")
+    _consent_flow(force=args.force)
+
+    # ---- 3. licence ------------------------------------------------------------------------------
+    print("\n== Licence " + "=" * 66 + "\n")
+    if has_key:
+        print("  %s" % ve.status_line(ent))
+        print("  Already activated on this machine. To move the seat elsewhere: veizik deactivate")
+    else:
+        print("  No key is active on this machine, so you are on the free path.")
+        print("")
+        print("  Get a free Starter Preview key:")
+        print("      1. open https://veizik.com")
+        print("      2. sign up with your email — the key is shown on screen and emailed to you")
+        print("      3. veizik activate vzk_live_...")
+        print("")
+        print("  Starter Preview: free for 7 days, 1 registered device, 1 concurrent node,")
+        print("  doctor + limited sample/capsule runs, experimental universal path, non-commercial.")
+        print("  The 7 days start at your FIRST SUCCESSFUL RENDER, not at activation.")
+        print("  Sharing performance data adds 3 days (see `veizik telemetry status`).")
+
+    _usage_save(dict(st, setup_at=_iso_now()))
+
+    print("\n" + "-" * 78)
+    print(" Next")
+    print("-" * 78)
+    if not has_key:
+        print("  veizik activate <YOUR_KEY>   activate this machine")
+    print("  veizik doctor                full hardware + per-family support tier table")
+    print("  veizik benchmark             record this machine's execution profile")
+    print("  veizik plans                 what each plan includes (billed by concurrent nodes)")
+    print("  veizik feature list          honest lifecycle status of every feature")
+    print("\nWhat runs in this download today: doctor, activate/status/logout, free entitlement,")
+    print("telemetry, plans, feature, upgrade, verify, pack — plus an EXPERIMENTAL universal")
+    print("t2v/t2i path (Linux + NVIDIA, your own torch/diffusers). ComfyUI run/serve, TimeMachine,")
+    print("the native CUDA engine, Queue/batch, Recover and the API bridge are NOT in it yet.")
+    _usage_note()
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik benchmark — this machine's execution profile.
+#
+#   HONESTY BOUNDARY, and it is the whole design of this command: the native engine is not in the
+#   public download, so there is no render to time. Inventing a "12.4 s/frame" here would be the
+#   easiest lie in the product and it is the one thing this command must never do. What it CAN
+#   measure it measures for real (hardware facts, and — only when torch is present — a GEMM and a
+#   memory-bandwidth micro-benchmark). Everything else is written out as "measurement in progress".
+# ---------------------------------------------------------------------------------------------------
+def _bench_time(fn, sync, warmup, iters):
+    """Timed loop with a real warmup. Without the warmup the first call carries context creation,
+    kernel autotuning and allocator growth, and the number comes out 2-10x too slow."""
+    for _ in range(warmup):
+        fn()
+    sync()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    sync()
+    return (time.perf_counter() - t0) / iters
+
+
+def _microbench(device=None):
+    """GEMM throughput + memory bandwidth. Returns a dict where every entry is either a measured
+    number or an explicit reason it was not measured. Never raises, never estimates."""
+    out = {"device": None, "dtype": None, "gemm_tflops": None, "gemm_shape": None,
+           "device_copy_gb_s": None, "host_to_device_gb_s": None, "notes": []}
+    try:
+        import torch
+    except Exception as e:
+        out["notes"].append("torch is not installed (%s) — no micro-benchmark is possible. "
+                            "%s for GEMM and bandwidth." % (type(e).__name__, _UNMEASURED))
+        return out
+
+    forced = bool(device)
+    if device:
+        dev = device
+    elif torch.cuda.is_available():
+        dev = "cuda"
+    elif getattr(getattr(torch, "backends", None), "mps", None) is not None \
+            and torch.backends.mps.is_available():
+        dev = "mps"
+    else:
+        dev = "cpu"
+    out["device"] = dev
+    out["device_forced"] = forced
+    if dev == "cpu":
+        out["notes"].append(("--device cpu was requested" if forced
+                             else "no GPU available to torch")
+                            + " — the numbers below are CPU numbers and say nothing about render "
+                              "performance.")
+    elif dev == "mps":
+        out["notes"].append("Apple MPS: measured for the record, but MPS is not a supported veizik "
+                            "render target.")
+
+    def _sync():
+        try:
+            if dev == "cuda":
+                torch.cuda.synchronize()
+            elif dev == "mps":
+                torch.mps.synchronize()
+        except Exception:
+            pass
+
+    # --- GEMM ------------------------------------------------------------------------------------
+    n = 4096 if dev == "cuda" else (2048 if dev == "mps" else 1024)
+    dtype = torch.float16 if dev in ("cuda", "mps") else torch.float32
+    out["dtype"] = str(dtype).replace("torch.", "")
+    out["gemm_shape"] = "%dx%dx%d" % (n, n, n)
+    try:
+        a = torch.randn(n, n, device=dev, dtype=dtype)
+        b = torch.randn(n, n, device=dev, dtype=dtype)
+        iters = 20 if dev == "cuda" else (10 if dev == "mps" else 3)
+        sec = _bench_time(lambda: torch.matmul(a, b), _sync, warmup=3, iters=iters)
+        out["gemm_tflops"] = round(2.0 * n ** 3 / sec / 1e12, 2)
+        out["gemm_ms"] = round(sec * 1e3, 3)
+        del a, b
+    except Exception as e:
+        out["notes"].append("GEMM micro-benchmark failed (%s: %s) — %s" % (type(e).__name__, e, _UNMEASURED))
+
+    # --- on-device memory bandwidth (read + write) -------------------------------------------------
+    try:
+        elems = 64 * 1024 * 1024 if dev == "cuda" else 16 * 1024 * 1024
+        src = torch.empty(elems, device=dev, dtype=torch.float32)
+        dst = torch.empty_like(src)
+        nbytes = src.numel() * src.element_size()
+        sec = _bench_time(lambda: dst.copy_(src), _sync, warmup=2,
+                          iters=10 if dev != "cpu" else 3)
+        out["device_copy_gb_s"] = round(2.0 * nbytes / sec / 1e9, 1)   # 1 read + 1 write
+        del src, dst
+    except Exception as e:
+        out["notes"].append("memory-bandwidth micro-benchmark failed (%s: %s) — %s"
+                            % (type(e).__name__, e, _UNMEASURED))
+
+    # --- host->device transfer (the offload path's actual cost) ------------------------------------
+    if dev == "cuda":
+        try:
+            elems = 32 * 1024 * 1024
+            host = torch.empty(elems, dtype=torch.float32).pin_memory()
+            devt = torch.empty(elems, device=dev, dtype=torch.float32)
+            nbytes = host.numel() * host.element_size()
+            sec = _bench_time(lambda: devt.copy_(host, non_blocking=True), _sync, warmup=2, iters=10)
+            out["host_to_device_gb_s"] = round(nbytes / sec / 1e9, 1)
+            del host, devt
+        except Exception as e:
+            out["notes"].append("H2D micro-benchmark failed (%s: %s) — %s"
+                                % (type(e).__name__, e, _UNMEASURED))
+    else:
+        out["notes"].append("host->device transfer is CUDA-only; not measured on %s." % dev)
+
+    try:
+        if dev == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return out
+
+
+def _ram_bucket(gb):
+    """Coarse RAM bucket. Telemetry gets a bucket, not the exact byte count, because the exact
+    figure is closer to a machine fingerprint than to a compatibility signal."""
+    if not gb:
+        return None
+    for edge in (8, 16, 32, 64, 128, 256, 512):
+        if gb <= edge * 1.05:
+            return edge
+    return 1024
+
+
+def _bench_run_report(hw, micro, started, ended, wall_s):
+    """Assemble a veizik-run-report-v1 for this benchmark and put it through the SAME scrubber the
+    render path uses. The micro-benchmark numbers are deliberately NOT in here: the run-report
+    allowlist has no field for them, and widening an allowlist to fit a payload is how privacy
+    promises rot. They stay in the local file only."""
+    vt = _tel()
+    gpus = hw.get("gpus") or []
+    g0 = gpus[0] if gpus else {}
+    cc = g0.get("compute_cap")
+    try:
+        ent = _ent().resolve(quiet=True)
+        tier_id = {"free": "starter_preview", "personal": "starter_preview", "creator": "creator",
+                   "pro": "pro", "studio": "studio"}.get(ent.tier, "starter_preview")
+    except Exception:
+        tier_id = "starter_preview"
+    report = vt.build_report(
+        license_tier=tier_id,
+        runtime={"veizik_version": _app_version()[0],
+                 "execution_backend": hw.get("accel") or "none",
+                 "profile_id": "benchmark-microbench-v1"},
+        hardware={"gpu_vendor": hw.get("gpu_vendor") or "none",
+                  "gpu_model": g0.get("name"),
+                  "gpu_vram_gb": g0.get("vram_total_gb"),
+                  "gpu_count": hw.get("gpu_count") or 0,
+                  "gpu_arch": ("sm_%s" % cc.replace(".", "")) if cc else None,
+                  "driver_version": g0.get("driver"),
+                  "cuda_version": hw.get("cuda_version"),
+                  "os_major": hw.get("os_major"),
+                  "cpu_class": hw.get("arch"),
+                  "ram_bucket_gb": _ram_bucket(hw.get("ram_gb"))},
+        workload={"model_public_id": "benchmark:microbench",
+                  "precision": micro.get("dtype") or "n/a",
+                  "batch": 1, "start_kind": "cold"},
+        result={"started_at": started, "ended_at": ended, "wall_s": round(wall_s, 3),
+                "status": "ok"},
+    )
+    return vt._scrub(report)
+
+
+def cmd_benchmark(args):
+    _banner()
+    t_start = time.time()
+    started = _iso_now()
+    print("\n[benchmark] execution profile for this machine")
+    print("[benchmark] %s" % _measurement_note())
+
+    # ---- 1. hardware ------------------------------------------------------------------------------
+    hw = _probe_hw_honest()
+    tier, verdict = _tier_verdict(hw)
+    print("\n[hardware]")
+    for ln in _hw_summary_lines(hw, tier, verdict):
+        print(ln)
+    print("  probe sources   %s" % ", ".join("%s=%s" % (k, v) for k, v in sorted(hw.get("sources", {}).items())))
+
+    # ---- 2. per-family support tier, but ONLY from measured hardware -------------------------------
+    fam_rows = []
+    if hw.get("accel") == "cuda" and (hw.get("gpus") or []):
+        try:
+            import copy
+            lu = _lu()
+            g0 = hw["gpus"][0]
+            probe = lu.HwProfile()
+            probe.n_gpus = hw.get("gpu_count") or 1
+            probe.gpu_name = g0.get("name") or probe.gpu_name
+            if g0.get("vram_total_gb"):
+                probe.gpu_total_gb = g0["vram_total_gb"]
+                probe.gpu_free_gb = g0.get("vram_free_gb") or g0["vram_total_gb"]
+            cc = (g0.get("compute_cap") or "").split(".")
+            if len(cc) == 2 and cc[0].isdigit() and cc[1].isdigit():
+                probe.sm = int(cc[0]) * 10 + int(cc[1])
+            probe.fp8_tc = probe.sm >= 89
+            probe.int8_tc = probe.sm >= 75
+            if hw.get("ram_gb"):
+                probe.host_ram_gb = hw["ram_gb"]
+            for fam in _FAMILY_ORDER:
+                tmpl = lu.FAMILY_TEMPLATES.get(fam)
+                if tmpl is None:
+                    continue
+                card = copy.deepcopy(tmpl)
+                card.confidence = 0.99
+                plan = lu.autotune(card, probe, args.target)
+                fam_rows.append((fam, plan.support_tier, plan.dtype, plan.attention, plan.offload))
+        except Exception as e:
+            print("\n[families] planner unavailable (%s: %s)" % (type(e).__name__, e))
+    if fam_rows:
+        print("\n[families]  planned from the MEASURED GPU above (not from defaults)")
+        print("  %-14s %-5s %-6s %-12s %s" % ("family", "tier", "dtype", "attention", "offload"))
+        for r in fam_rows:
+            print("  %-14s %-5s %-6s %-12s %s" % r)
+        print("  render time     %s for every row — the native engine is not in this download" % _UNMEASURED)
+    else:
+        print("\n[families] not planned: no measured CUDA GPU on this host. `veizik doctor` will still")
+        print("           print the table, but from limml_universal's DEFAULT profile, not from"
+              " measurement.")
+
+    # ---- 3. micro-benchmarks ----------------------------------------------------------------------
+    micro = {"skipped": True, "notes": ["--no-micro was passed"]} if args.no_micro \
+        else _microbench(args.device or None)
+    print("\n[microbench]")
+    if args.no_micro:
+        print("  skipped (--no-micro)")
+    else:
+        print("  device          %s" % (micro.get("device") or "none"))
+        print("  GEMM %-10s %s" % (micro.get("gemm_shape") or "",
+                                   ("%.2f TFLOP/s (%s, %.3f ms)"
+                                    % (micro["gemm_tflops"], micro.get("dtype"), micro.get("gemm_ms", 0.0)))
+                                   if micro.get("gemm_tflops") else _UNMEASURED))
+        print("  device copy     %s" % (("%.1f GB/s (read+write)" % micro["device_copy_gb_s"])
+                                        if micro.get("device_copy_gb_s") else _UNMEASURED))
+        print("  host -> device  %s" % (("%.1f GB/s (pinned)" % micro["host_to_device_gb_s"])
+                                        if micro.get("host_to_device_gb_s") else _UNMEASURED))
+        for note in micro.get("notes") or []:
+            print("  note            %s" % note)
+
+    # ---- 4. what is NOT measured, said plainly ----------------------------------------------------
+    print("\n[not measured]")
+    print("  render time / frames-per-second       %s" % _UNMEASURED)
+    print("  peak VRAM for a real render           %s" % _UNMEASURED)
+    print("  native T1 engine throughput           %s (engine not distributed)" % _UNMEASURED)
+    print("  The single measured figure veizik publishes today is LTX-13B peak VRAM 9.55 GB")
+    print("  (internal) plus block/engine-level rel_L2 accuracy.")
+
+    # ---- 5. run-report + telemetry ----------------------------------------------------------------
+    ended = _iso_now()
+    wall = time.time() - t_start
+    report, queued, clean = None, None, None
+    try:
+        vt = _tel()
+        report = _bench_run_report(hw, micro, started, ended, wall)
+        clean = vt.report_is_clean(report)
+        if vt.is_enabled():
+            # Deliberately spool directly instead of calling record_run(): that helper bumps
+            # cumulative_successes and can set first_success_at, i.e. it would let a benchmark
+            # masquerade as a render. §16 counts "first successful render" as a real metric and the
+            # Starter trial clock starts there, so a benchmark must never touch either.
+            queued = vt._spool(report)
+    except Exception as e:
+        print("\n[report] could not build the run report (%s: %s)" % (type(e).__name__, e))
+
+    out_path = args.out or os.path.join(_VEIZIK_HOME,
+                                        "benchmark-%s.json" % time.strftime("%Y%m%dT%H%M%SZ",
+                                                                            time.gmtime()))
+    doc = {"veizik_benchmark": "v1",
+           "generated_at": ended,
+           "app_version": _app_version()[0],
+           "hardware_probe": hw,
+           "support_tier": {"tier": tier, "verdict": verdict, "families": [
+               {"family": f, "tier": t, "dtype": d, "attention": a, "offload": o}
+               for (f, t, d, a, o) in fam_rows]},
+           "microbench": micro,
+           "unmeasured": {"render_time_s": _UNMEASURED, "peak_vram_gb": _UNMEASURED,
+                          "native_engine_throughput": _UNMEASURED},
+           # schema-compatible: this is exactly the object telemetry would transmit
+           "run_report": report,
+           "run_report_schema": getattr(_tel_safe(), "SCHEMA_VERSION", "veizik-run-report-v1"),
+           "run_report_passes_scrubber": clean}
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(doc, f, indent=2, default=str)
+        print("\n[report] written -> %s" % os.path.abspath(out_path))
+        print("[report] run_report section conforms to %s%s"
+              % (doc["run_report_schema"],
+                 "" if clean is not False else "  (WARNING: it did NOT pass the scrubber)"))
+        print("[report] the micro-benchmark numbers stay in this file: the run-report allowlist has")
+        print("         no field for them, and we do not widen an allowlist to fit a payload.")
+    except OSError as e:
+        print("\n[report] could not write %s (%s)" % (out_path, e))
+
+    if queued:
+        print("\n[telemetry] queued for the next batch (you consented to performance data).")
+        print("[telemetry] see the exact bytes:   veizik telemetry show-last")
+        print("[telemetry] send them now:         veizik telemetry send --force")
+        print("\n[contributor] Telemetry Contributor — what sharing gets you")
+        print("  your hardware        %s" % ((hw.get("gpus") or [{}])[0].get("name") or "no GPU detected"))
+        print("  community median     %s (needs contributed reports before a median exists)" % _UNMEASURED)
+        print("  yours vs median      %s" % _UNMEASURED)
+        print("  stability            %s" % _UNMEASURED)
+        print("  recommended profile  %s — stable profiles ship in the Creator pack" % _UNMEASURED)
+        print("  also included        automatic profile correction, priority compatibility analysis,")
+        print("                       an externally-verified Badge, early Adapter access,")
+        print("                       +3 days of Starter Preview, optional public benchmark")
+        print("                       contributor credit, and a vote on which hardware we support next.")
+    else:
+        print("\n[telemetry] not queued — optional performance sharing is off, which locks nothing.")
+        print("[telemetry] sharing would add: a benchmark report for your machine, automatic profile")
+        print("            correction, priority compatibility analysis, an external Badge, early")
+        print("            Adapter access, +3 days of Starter Preview, and a hardware-support vote.")
+        print("[telemetry] turn it on:  veizik telemetry enable")
+
+    _usage_note()
+    return 0
+
+
+def _tel_safe():
+    """_tel() but returns a stub object on import failure — used only for a version string."""
+    try:
+        return _tel()
+    except Exception:
+        return type("_Stub", (), {"SCHEMA_VERSION": "veizik-run-report-v1"})()
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik deactivate — release THIS machine's registration.
+#
+#   The seat lives on the server, so the release has to happen there; wiping the local session alone
+#   would leave the user's device count silently consumed. We therefore call the server FIRST and
+#   only then drop local state, and we say plainly what happened when the server is unreachable.
+# ---------------------------------------------------------------------------------------------------
+_DEVICE_RELEASE_LIMIT = 3          # device changes per year; the server is the authority, not this
+
+
+def _release_device(api_key, device_id):
+    """POST /api/device/release. Returns (ok, payload_or_error_string)."""
+    import urllib.error
+    ve = _ent()
+    try:
+        return True, ve._http("POST", "/api/device/release",
+                              {"api_key": api_key, "device_id": device_id})
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {}
+        if e.code == 404:
+            return False, ("the server has no /api/device/release route yet (HTTP 404)")
+        return False, (body.get("error") or "server refused the release (HTTP %d)" % e.code)
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def cmd_deactivate(args):
+    _banner()
+    ve = _ent()
+    _ls = getattr(ve, "load_session", None) or getattr(ve, "_load_session", None)
+    sess = None
+    if _ls:
+        try:
+            sess = _ls()
+        except Exception:
+            sess = None
+    api_key = (sess or {}).get("api_key")
+
+    try:
+        import veizik_session as vs
+        device_id = vs.device_id()
+    except Exception as e:
+        device_id = None
+        print("[deactivate] could not read this machine's device id (%s)" % e)
+
+    if not api_key:
+        print("\n[deactivate] no licence is active on this machine — nothing to release.")
+        print("[deactivate] `veizik logout` clears a local session; `veizik activate <KEY>` adds one.")
+        return 0
+
+    print("\n  licence         %s" % ve.status_line(ve.resolve(quiet=True)))
+    print("  device id       %s   (pseudonymous, local)" % (device_id or "unknown"))
+    print("\nThis releases THIS machine's registration so you can activate another one.")
+    print("Your licence, your plan and your renders are untouched, and you can re-activate here")
+    print("at any time with the same key.")
+
+    if not args.yes:
+        try:
+            ans = input("\nRelease this machine? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("[deactivate] cancelled — nothing was changed.")
+            return 0
+
+    # 1. server side first: the seat is the thing that actually matters.
+    ok, res = (False, "skipped (--local-only)") if args.local_only \
+        else _release_device(api_key, device_id)
+    if ok and isinstance(res, dict) and not res.get("error"):
+        print("\n[deactivate] server released this device.")
+        used = res.get("releases_used")
+        remaining = res.get("releases_remaining")
+        limit = res.get("releases_limit") or _DEVICE_RELEASE_LIMIT
+        if remaining is None and used is not None:
+            try:
+                remaining = max(0, int(limit) - int(used))
+            except (TypeError, ValueError):
+                remaining = None
+        if remaining is not None:
+            print("[deactivate] device changes: %s of %s used this year, %s remaining."
+                  % (used if used is not None else "?", limit, remaining))
+            if int(remaining) == 0:
+                print("[deactivate] that was the last one for this licence year. Further moves need")
+                print("             support: https://veizik.com  (we do move them, it is just manual).")
+        else:
+            print("[deactivate] device changes: the server did not report a count. The published")
+            print("             limit is %d per licence year." % _DEVICE_RELEASE_LIMIT)
+        if res.get("registered_devices") is not None:
+            print("[deactivate] devices still registered: %s" % res["registered_devices"])
+    else:
+        print("\n[deactivate] server release did NOT happen: %s" % res)
+        print("[deactivate] the seat is still held server-side, so it still counts against your")
+        if args.local_only:
+            print("             registered devices. Free it with:  veizik deactivate   (no --local-only)")
+        else:
+            print("             registered devices. Re-run this command once you are online, or ask")
+            print("             https://veizik.com to clear it.")
+        print("[deactivate] published limit: %d device changes per licence year." % _DEVICE_RELEASE_LIMIT)
+
+    # 2. local state: what the user asked for, regardless of what the server said.
+    dropped = ve.logout()
+    print("\n[deactivate] local session %s" % ("removed" if dropped else "was not present"))
+    if args.forget_device:
+        try:
+            import veizik_session as vs
+            os.remove(vs.DEVICE_FILE)
+            print("[deactivate] device id forgotten — this machine will register as a NEW device.")
+            print("             (That consumes another device slot if you re-activate here.)")
+        except OSError as e:
+            print("[deactivate] device id not removed (%s)" % e)
+    else:
+        print("[deactivate] device id kept, so re-activating here reuses the same slot.")
+        print("             Use --forget-device only if you are retiring this machine.")
+    print("\n[deactivate] this machine is now on the free path:  veizik status")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik update — update the installation.
+#
+#   The installer (web/install.sh) is the single update mechanism: it pins a git tag, installs the
+#   locked deps and checksums the engine. Re-running it IS the update, so this command's job is to
+#   report where you are, hand you that exact line, and refuse to run it behind your back unless you
+#   asked with --yes. After any update the signed packs should be re-verified — a partial update
+#   leaves them intact-but-stale, which `pack verify` is designed to catch.
+# ---------------------------------------------------------------------------------------------------
+def _latest_release_tag():
+    """Newest release tag in the distribution repo, or (None, reason). Network, best-effort."""
+    if not _run_out(["git", "--version"], timeout=5):
+        return None, "git is not installed, so the tag list cannot be read"
+    out = _run_out(["git", "ls-remote", "--tags", "--refs", _VZ_REPO], timeout=25)
+    if out is None:
+        return None, "could not reach %s" % _VZ_REPO
+    tags = []
+    for line in out.splitlines():
+        parts = line.split("refs/tags/")
+        if len(parts) == 2 and parts[1].strip():
+            tags.append(parts[1].strip())
+    if not tags:
+        return None, "the repository has no release tags"
+
+    def _key(t):
+        nums = []
+        for chunk in t.lstrip("v").replace("-", ".").split("."):
+            nums.append(int(chunk) if chunk.isdigit() else -1)
+        return nums
+    return sorted(tags, key=_key)[-1], None
+
+
+def cmd_update(args):
+    _banner()
+    version, source = _app_version()
+    print("\n[update] installed version   %s" % version)
+    print("[update] version source      %s" % source)
+    print("[update] install root        %s%s"
+          % (_VZ_HOME, "" if os.path.isdir(_VZ_HOME) else "   (not present — running from a checkout?)"))
+    print("[update] running from        %s" % _HERE)
+    print("[update] python              %s" % sys.executable)
+
+    if args.check or args.yes:
+        latest, why = _latest_release_tag()
+        if latest:
+            print("[update] latest release tag  %s" % latest)
+            if version in ("unknown",):
+                print("[update] cannot compare: this install does not report a version.")
+            elif latest.lstrip("v") == version.lstrip("v"):
+                print("[update] you are on the latest release.")
+            else:
+                print("[update] an update is available: %s -> %s" % (version, latest))
+        else:
+            print("[update] latest release tag  unknown (%s)" % why)
+
+    cmd = "curl -fsSL %s | sh" % _INSTALL_URL
+    print("\n[update] the installer IS the updater — it re-pins the tag, reinstalls the locked")
+    print("         dependencies and re-checksums the engine:")
+    print("\n    %s\n" % cmd)
+    # env goes on the RIGHT-hand sh: that is the process the installer actually runs in.
+    print("[update] pin a specific version instead:   curl -fsSL %s | VZ_VERSION=v0.2.0 sh"
+          % _INSTALL_URL)
+
+    if not args.yes:
+        print("\n[update] not run. veizik does not execute a network install script on your behalf")
+        print("         unless you ask:   veizik update --yes")
+    else:
+        if not _run_out(["curl", "--version"], timeout=5):
+            print("\n[update] curl is not installed — run the line above with your own downloader.")
+            return 1
+        print("\n[update] running the installer (--yes given)...")
+        sys.stdout.flush()      # the child writes straight to the tty; flush so the order survives a pipe
+        try:
+            rc = subprocess.call(["sh", "-c", cmd])
+        except Exception as e:
+            print("[update] installer could not be launched (%s)" % e)
+            return 1
+        if rc != 0:
+            print("\n[update] installer exited rc=%d — your existing install is untouched." % rc)
+            return rc
+        print("\n[update] installer finished.")
+
+    print("\n[update] after ANY update, re-verify the signed packs: an interrupted or partial update")
+    print("         leaves them on disk looking fine while no longer matching what veizik signed.")
+    print("\n    veizik pack verify\n")
+    if args.yes:
+        print("[update] running it now...")
+        try:
+            return cmd_pack(argparse.Namespace(pack_action="verify"))
+        except Exception as e:
+            print("[update] pack verify could not run (%s: %s) — run it yourself." % (type(e).__name__, e))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
 #   argparse
 # ---------------------------------------------------------------------------------------------------
 def build_parser():
@@ -2026,6 +3314,42 @@ def build_parser():
 
     p_doc = sub.add_parser("doctor", help="probe hardware + list every model family's support tier")
     p_doc.set_defaults(func=cmd_doctor)
+
+    # setup — first-run onboarding: hardware summary -> two-screen consent -> key -> next command.
+    p_setup = sub.add_parser("setup", help="first-run onboarding: check this machine, consent "
+                             "screens, how to get a key, what to type next")
+    p_setup.add_argument("--force", action="store_true",
+                         help="run the wizard again and re-ask the consent screens")
+    p_setup.set_defaults(func=cmd_setup)
+
+    # benchmark — measure what is measurable on this box; never invent a render time.
+    p_bench = sub.add_parser("benchmark", help="this machine's execution profile: hardware probe, "
+                             "support tier, GEMM/bandwidth micro-benchmark, run-report JSON")
+    p_bench.add_argument("--out", default="", help="report path (default ~/.veizik/benchmark-<ts>.json)")
+    p_bench.add_argument("--no-micro", action="store_true", dest="no_micro",
+                         help="skip the GEMM/bandwidth micro-benchmark (hardware probe only)")
+    p_bench.add_argument("--device", default="", choices=["", "cuda", "mps", "cpu"],
+                         help="force the micro-benchmark device (default: best available)")
+    p_bench.set_defaults(func=cmd_benchmark)
+
+    # deactivate — release this machine's registration (server-side seat + local session).
+    p_deact = sub.add_parser("deactivate", help="release THIS machine's registration so another "
+                             "machine can be activated")
+    p_deact.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    p_deact.add_argument("--local-only", action="store_true", dest="local_only",
+                         help="clear local state only; do NOT ask the server to free the seat")
+    p_deact.add_argument("--forget-device", action="store_true", dest="forget_device",
+                         help="also discard the device id (this machine re-registers as new — only "
+                              "for a machine you are retiring)")
+    p_deact.set_defaults(func=cmd_deactivate)
+
+    # update — report the installed version and hand over the installer line.
+    p_upd = sub.add_parser("update", help="show the installed version and how to update "
+                           "(runs the installer only with --yes)")
+    p_upd.add_argument("--check", action="store_true", help="also look up the latest release tag")
+    p_upd.add_argument("--yes", action="store_true",
+                       help="actually run the installer, then re-verify the signed packs")
+    p_upd.set_defaults(func=cmd_update)
 
     # license: activate / inspect / clear an API key (unlocks your tier; free without one)
     p_login = sub.add_parser("login", help="activate a veizik API key (unlocks your paid tier)")
@@ -2058,6 +3382,15 @@ def build_parser():
     p_up.add_argument("plan", choices=["creator", "pro"], help="target plan")
     p_up.set_defaults(func=cmd_upgrade)
 
+    # §14 Pro Preview commands — registered so typing one gets an honest status answer instead of
+    # "invalid choice". They intentionally do NOT run anything; see cmd_pro_preview.
+    for _pv in _PRO_PREVIEW_CMDS:
+        _p = sub.add_parser(_pv, help="Pro Preview: %s — NOT in the public download today"
+                            % _FEATURES.get(_pv, ("", [], _pv, ""))[2])
+        _p.add_argument("rest", nargs=argparse.REMAINDER,
+                        help="accepted and ignored; the command does not execute in this build")
+        _p.set_defaults(func=cmd_pro_preview, preview_feature=_pv)
+
     # pack — signed runtime packs: one public binary + entitlement + per-tier pack.
     # Every install path runs through an Ed25519 signature check against the public key embedded
     # in this client; there is deliberately no --skip-verify / --force / --insecure flag to add.
@@ -2075,10 +3408,14 @@ def build_parser():
     p_pack.set_defaults(func=cmd_pack, pack_action=None)
 
     # telemetry — the OPTIONAL performance/compatibility channel only
-    p_tel = sub.add_parser("telemetry", help="optional performance data: status/enable/disable/"
-                           "show-last/queue/send/export/delete")
+    p_tel = sub.add_parser("telemetry", help="optional performance data: status/benefits/contributor/"
+                           "consent/enable/disable/show-last/queue/send/export/delete")
     tsub = p_tel.add_subparsers(dest="telemetry_action")
     tsub.add_parser("status", help="consent version/time, pending count, exactly what is and is not collected")
+    tsub.add_parser("benefits", help="what sharing performance data gets you (§6) — benefits, never unlocks")
+    tsub.add_parser("contributor", help="your Telemetry Contributor report: this machine's hardware, "
+                                        "runs and stability")
+    tsub.add_parser("consent", help="re-show the two-step consent screens and change your answer")
     tsub.add_parser("enable", help="turn optional performance reporting ON")
     t_dis = tsub.add_parser("disable", help="stop all future transmission (asks about the local queue)")
     t_dis.add_argument("--purge", action="store_true", help="also delete the local queue, no prompt")

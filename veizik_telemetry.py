@@ -75,6 +75,14 @@ __all__ = [
     "delete",
     "consent_screen_text",
     "retention_note",
+    # §6 contributor benefits
+    "CONTRIBUTOR_BENEFITS",
+    "TRIAL_EXTENSION_DAYS",
+    "benefits_text",
+    "grant_contributor_benefits",
+    "contributor_grant",
+    "contributor_report",
+    "contributor_report_text",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +91,11 @@ __all__ = [
 
 SCHEMA_VERSION = "veizik-run-report-v1"
 CONSENT_VERSION = "telemetry-v1.1"
+
+# §6 — sharing performance data buys BENEFITS. It never unlocks a core feature, because a feature
+# that unlocks on consent is a feature you were charged for and then held hostage; under GDPR
+# Art. 7(4) that also makes the consent not freely given, i.e. void. Carrot only, never stick.
+TRIAL_EXTENSION_DAYS = 3
 
 # Telemetry endpoint is intentionally NOT the license endpoint.
 DEFAULT_TELEMETRY_BASE = "https://veizik.com/v1/events"
@@ -973,8 +986,16 @@ NEVER_COLLECTED_DESCRIPTION: List[str] = [
 
 
 def enable() -> Dict[str, Any]:
-    """Record an affirmative opt-in for the CURRENT consent version."""
+    """Record an affirmative opt-in for the CURRENT consent version.
+
+    Also books the §6 grant LOCALLY (idempotent, no network here — `grant_contributor_benefits()`
+    owns the server sync, so importing this module never opens a socket).
+    """
     _save_consent(True)
+    try:
+        _record_grant()
+    except Exception:
+        pass
     return status()
 
 
@@ -1172,50 +1193,383 @@ def delete(request_server_deletion: bool = True) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# §6 — Contributor benefits
+#
+# The design rule this section exists to enforce: we buy telemetry with VALUE,
+# not with hostages. Nothing below is a core feature, so nothing below can be
+# read as "pay with your data or lose what you bought".
+# --------------------------------------------------------------------------- #
+
+CONTRIBUTOR_BENEFITS: List[Tuple[str, str]] = [
+    ("Personal benchmark report",
+     "a benchmark of YOUR machine — your timings against your own history"),
+    ("Automatic profile correction",
+     "execution profiles retuned from what actually happens on your GPU"),
+    ("Priority compatibility analysis",
+     "failures on your hardware go to the front of the triage queue"),
+    ("Externally verified badge",
+     "an independently verified 'runs on this hardware' badge for your machine"),
+    ("Early Adapter support",
+     "new Model Adapters reach contributing hardware first"),
+    ("Starter Preview +%d days" % TRIAL_EXTENSION_DAYS,
+     "%d extra days of Starter Preview, granted once" % TRIAL_EXTENSION_DAYS),
+    ("Public benchmark credit",
+     "opt in to be listed as a contributor on the public benchmark (your choice, off by default)"),
+    ("Hardware support vote",
+     "a vote on which GPU families get support priority next"),
+]
+
+
+def benefits_text() -> str:
+    """`veizik telemetry benefits` body."""
+    lines = [
+        "Sharing performance data — what you get back",
+        "",
+    ]
+    width = max(len(name) for name, _ in CONTRIBUTOR_BENEFITS)
+    for name, detail in CONTRIBUTOR_BENEFITS:
+        lines.append("  + %-*s  %s" % (width, name, detail))
+    lines += [
+        "",
+        "  These are additions, not unlocks. No feature of any plan is withheld from",
+        "  anyone who declines — declining is a supported, permanent, penalty-free choice.",
+    ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Starter +3 days grant
+#
+# Local-first: the grant is recorded on this machine the moment consent is given,
+# so the user has the benefit even if veizik.com is unreachable, down, or does not
+# exist yet. The server call is a best-effort SYNC of that fact, never a
+# precondition. It also runs off the render path entirely.
+#
+# Endpoint note: this posts to the veizik.com web origin (/api/trial/extend), which
+# is NOT the license API (api.veizik.com/v1/license) this module is documented never
+# to touch. The data-class separation at the top of the file still holds.
+# --------------------------------------------------------------------------- #
+
+
+def _license_api_base() -> str:
+    return os.environ.get("VEIZIK_API_BASE", "https://veizik.com").rstrip("/")
+
+
+def _license_api_key() -> Optional[str]:
+    """Read the api_key out of the license session WITHOUT importing the license client.
+
+    A plain file read keeps this module free of a dependency on veizik_entitlement (and of any
+    import cycle): telemetry may observe the license session, never drive it.
+    """
+    path = os.path.expanduser(os.environ.get("VEIZIK_SESSION", "~/.veizik/session.json"))
+    sess = _read_json(path) or {}
+    key = sess.get("api_key")
+    return key if isinstance(key, str) and key else None
+
+
+def contributor_grant() -> Dict[str, Any]:
+    """Local record of the benefits granted for consenting. Empty dict when never granted."""
+    return dict(_state().get("contributor_grant") or {})
+
+
+def _record_grant() -> Dict[str, Any]:
+    """Idempotent. A second consent (disable -> enable) must not mint a second +3 days."""
+    st = _state()
+    grant = dict(st.get("contributor_grant") or {})
+    if grant.get("granted_at"):
+        return grant
+    grant = {
+        "reason": "telemetry_consent",
+        "granted_at": _iso_now(),
+        "trial_extension_days": TRIAL_EXTENSION_DAYS,
+        "server_synced": False,
+    }
+    st["contributor_grant"] = grant
+    _write_json(STATE_PATH, st)
+    return grant
+
+
+def _mark_grant_synced(ok: bool) -> None:
+    st = _state()
+    grant = dict(st.get("contributor_grant") or {})
+    if not grant:
+        return
+    grant["server_synced"] = bool(ok)
+    grant["server_sync_attempted_at"] = _iso_now()
+    st["contributor_grant"] = grant
+    _write_json(STATE_PATH, st)
+
+
+# Short on purpose: this runs at the end of an interactive command, so the user is watching a
+# prompt that has not returned yet. A benefit is not worth an 8-second stall.
+TRIAL_SYNC_TIMEOUT_S = 4.0
+
+
+def _post_trial_extend(api_key: str, reason: str = "telemetry_consent") -> bool:
+    try:
+        body = json.dumps({"api_key": api_key, "reason": reason}).encode("utf-8")
+        req = urllib.request.Request(
+            _license_api_base() + "/api/trial/extend",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": _UA},
+        )
+        with urllib.request.urlopen(req, timeout=TRIAL_SYNC_TIMEOUT_S) as resp:
+            code = int(getattr(resp, "status", None) or resp.getcode())
+            resp.read()
+        return 200 <= code < 300
+    except Exception:
+        # Offline, 404 (server not deployed yet), captive portal, TLS interception — all the same
+        # to us. The local grant already stands; silence is the correct behaviour.
+        return False
+
+
+def grant_contributor_benefits(network: bool = True, background: bool = False) -> Dict[str, Any]:
+    """Called when the user says yes to optional telemetry.
+
+    Records the grant locally (idempotent) and, if we have a license key, syncs it to the server.
+
+    The sync is SYNCHRONOUS by default, with a 4s cap. That is deliberate: every caller is an
+    interactive command (`activate`, `telemetry enable`, `telemetry consent`) that exits within
+    milliseconds of this returning, and a daemon thread in a process that is about to exit is
+    killed before the socket ever connects — it would look implemented and send nothing. Renders
+    never call this, so nothing on the render path can block. `background=True` exists for a
+    future long-lived caller (a server/daemon) where the thread genuinely outlives the call.
+
+    Returns the local grant record. NEVER raises.
+    """
+    try:
+        grant = _record_grant()
+    except Exception:
+        return {}
+    if not network or grant.get("server_synced"):
+        return grant
+    key = _license_api_key()
+    if not key:
+        # Starter Preview with no activated key: there is no license row to extend server-side
+        # yet. The local grant stands, and the next `activate`/`telemetry enable` syncs it.
+        return grant
+    try:
+        if background:
+            import threading
+
+            threading.Thread(
+                target=lambda: _mark_grant_synced(_post_trial_extend(key)), daemon=True
+            ).start()
+            return grant
+        ok = _post_trial_extend(key)
+        _mark_grant_synced(ok)
+        grant = contributor_grant()
+    except Exception:
+        pass
+    return grant
+
+
+# --------------------------------------------------------------------------- #
+# Telemetry Contributor report
+#
+# HONESTY RULE, non-negotiable: there is no server-side aggregate yet, so there is
+# no community median. We print "not enough samples yet" and print NO number.
+# Inventing a plausible median here would be fabricating a measurement — the one
+# thing this whole product is not allowed to do.
+# --------------------------------------------------------------------------- #
+
+COMMUNITY_COMPARISON_UNAVAILABLE = "community comparison: not enough samples yet"
+
+
+def _recent_runs(limit: int = 5) -> List[Dict[str, Any]]:
+    """Summaries of the run reports this machine still holds locally (newest last)."""
+    out: List[Dict[str, Any]] = []
+    for item in queue()[-limit:]:
+        rep = item.get("report") or {}
+        wl = rep.get("workload") or {}
+        res = rep.get("result") or {}
+        rt = rep.get("runtime") or {}
+        out.append({
+            "model": wl.get("model_public_id") or rt.get("capsule_id") or "-",
+            "profile": rt.get("profile_id") or "-",
+            "geometry": "%sx%s%s" % (wl.get("width", "-"), wl.get("height", "-"),
+                                     ("x%sf" % wl["frames"]) if wl.get("frames") else ""),
+            "steps": wl.get("steps", "-"),
+            "wall_s": res.get("wall_s"),
+            "peak_vram_gb": res.get("peak_vram_gb"),
+            "status": res.get("status", "-"),
+        })
+    return out
+
+
+def _stability() -> Dict[str, Any]:
+    """Success rate over the reports held locally. None when there is nothing to divide by —
+    a 0-sample 'stability: 100%' would be a lie of the same species as a fake median."""
+    runs = _recent_runs(limit=SPOOL_MAX_ITEMS)
+    if not runs:
+        return {"samples": 0, "ok": 0, "rate": None}
+    ok = sum(1 for r in runs if r.get("status") == "ok")
+    return {"samples": len(runs), "ok": ok, "rate": ok / float(len(runs))}
+
+
+def contributor_report(hardware: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Data for `veizik telemetry contributor`.
+
+    `hardware` is passed in by the caller (the CLI probes it through limml_universal) so this
+    module stays stdlib-only and never imports the engine.
+    """
+    st = _state()
+    return {
+        "enabled": is_enabled(),
+        "installation_id": installation_id(),
+        "hardware": hardware or {},
+        "recent_runs": _recent_runs(),
+        "totals": {
+            "cumulative_successes": st.get("cumulative_successes", 0),
+            "active_days": st.get("active_days", 0),
+            "first_success_at": st.get("first_success_at"),
+        },
+        "stability": _stability(),
+        "community": {
+            "available": False,
+            "reason": COMMUNITY_COMPARISON_UNAVAILABLE,
+            "median": None,          # stays None until a real aggregate exists. Do not fill in.
+            "mine": None,
+        },
+        "recommended_profile": None,  # set only by a server-issued profile correction
+        "grant": contributor_grant(),
+    }
+
+
+def contributor_report_text(hardware: Optional[Dict[str, Any]] = None) -> str:
+    r = contributor_report(hardware)
+    lines = ["Telemetry Contributor", ""]
+
+    lines.append("  Sharing            %s" % ("ON" if r["enabled"] else "OFF"))
+    lines.append("  Installation id    %s  (pseudonymous)" % r["installation_id"])
+
+    lines += ["", "  My hardware"]
+    hw = r["hardware"]
+    if hw:
+        for key in ("gpu", "gpu_count", "vram_gb", "driver", "cuda", "os", "cpu", "ram_gb",
+                    "runtime"):
+            if hw.get(key) not in (None, "", "-"):
+                lines.append("    %-14s %s" % (key, hw[key]))
+    else:
+        lines.append("    (not probed — run `veizik doctor` on this machine)")
+
+    lines += ["", "  My recent runs"]
+    runs = r["recent_runs"]
+    if runs:
+        for run in runs:
+            lines.append("    %-14s %-12s %-6s steps  wall=%-8s peak=%-6s %s"
+                         % (run["model"], run["geometry"], run["steps"],
+                            _fmt_num(run["wall_s"], "s"), _fmt_num(run["peak_vram_gb"], "GB"),
+                            run["status"]))
+    else:
+        lines.append("    no run reports held on this machine yet")
+    t = r["totals"]
+    lines.append("    successful renders so far: %s   active days: %s"
+                 % (t["cumulative_successes"], t["active_days"]))
+
+    stab = r["stability"]
+    lines += ["", "  Stability"]
+    if stab["rate"] is None:
+        lines.append("    not enough runs recorded yet")
+    else:
+        lines.append("    %d/%d succeeded (%.0f%%) across the reports held locally"
+                     % (stab["ok"], stab["samples"], 100.0 * stab["rate"]))
+
+    lines += ["", "  Community comparison"]
+    lines.append("    %s" % r["community"]["reason"])
+    lines.append("    (median vs. yours appears here once enough machines have reported;")
+    lines.append("     no figure is shown until it is a real measurement)")
+
+    lines += ["", "  Recommended profile"]
+    lines.append("    %s" % (r["recommended_profile"]
+                             or "none issued yet — profile correction needs the aggregate above"))
+
+    g = r["grant"]
+    if g.get("granted_at"):
+        lines += ["", "  Granted for contributing"]
+        lines.append("    Starter Preview +%s days  (recorded %s, server sync %s)"
+                     % (g.get("trial_extension_days", TRIAL_EXTENSION_DAYS), g["granted_at"],
+                        "ok" if g.get("server_synced") else "pending"))
+    return "\n".join(lines)
+
+
+def _fmt_num(value: Any, unit: str) -> str:
+    if value is None:
+        return "-"
+    try:
+        return "%.1f%s" % (float(value), unit)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# --------------------------------------------------------------------------- #
 # Consent screen copy (2 steps, per spec)
 # --------------------------------------------------------------------------- #
 
 
 def consent_screen_text() -> Dict[str, Any]:
-    """Copy for the two-step consent flow.
+    """Canonical copy for the two-step first-run flow (spec §5). ONE source of truth: the CLI
+    renders this dict, it does not carry its own wording.
 
-    Step 1 is a NOTICE (Continue only) — license operation data is necessary to
-    provide the purchased service, so it is not consent-based and must not be
-    dressed up as a choice.
-    Step 2 is CONSENT (Yes/No, both proceed) — optional performance data.
+    The two screens are separate on purpose and MUST NOT be collapsed into a single checkbox.
+    They are different legal objects:
+
+      Step 1 is a NOTICE, not a choice. License operation data is strictly necessary to deliver
+             the thing the user bought (GDPR Art. 6(1)(b)), so offering a "no" would be a lie —
+             there is no product without it. Only [Continue].
+      Step 2 is CONSENT (Art. 6(1)(a)): specific, informed, affirmative, and freely given. Both
+             answers continue, and No costs the user nothing they paid for.
+
+    Bundling them would make step 2 look conditional on using the product, which is exactly what
+    Art. 7(4) voids.
     """
     return {
         "step_1": {
             "kind": "notice",
-            "title": "License operation data",
+            "title": "Veizik license operation",
             "body": [
-                "To run Veizik under your license we process: license id/hash, a "
-                "pseudonymous device identifier, your plan, app and protocol "
-                "version, activation state, verification time, run lease and "
-                "expiry, and subscription state.",
-                "This is the minimum required to operate the license — including "
-                "your registered-device and concurrent-node limits — and is not "
-                "optional.",
-                "It is handled by the license service, separately from anything "
-                "on the next screen.",
+                "Veizik processes the following to operate your license:",
             ],
+            "items": [
+                "License identifier",
+                "Pseudonymous device identifier",
+                "Product tier and runtime version",
+                "Activation and concurrent-use status",
+            ],
+            "assurance": "Input files, prompts and generated outputs are not transmitted.",
             "actions": ["Continue"],
         },
         "step_2": {
             "kind": "consent",
-            "title": "Optional performance and compatibility data",
+            "title": "Help improve hardware compatibility",
             "body": [
-                "May we collect hardware, run settings and timing results, so "
-                "Veizik gets faster and more compatible on machines like yours?",
-                "Collected: " + "; ".join(COLLECTED_DESCRIPTION),
-                "Never collected: " + "; ".join(NEVER_COLLECTED_DESCRIPTION),
-                retention_note(),
-                "Change it any time with `veizik telemetry disable`, inspect what "
-                "would be sent with `veizik telemetry show-last`, and erase it "
-                "with `veizik telemetry delete`.",
-                "Saying No changes nothing about the features you have paid for.",
+                "Optional. Sharing this helps Veizik run better on machines like yours:",
             ],
-            "actions": ["Yes, share performance data", "No thanks"],
+            "items": [
+                "GPU, VRAM, OS, runtime",
+                "Model and profile identifiers, render settings",
+                "Render time, memory use, success and error codes",
+            ],
+            "assurance": (
+                "Veizik does not upload your prompts, input files, generated media "
+                "or local file paths."
+            ),
+            "commands": [
+                "veizik telemetry status     what is shared, and when",
+                "veizik telemetry show-last  the exact last report, verbatim",
+                "veizik telemetry export     the exact bytes that would be uploaded",
+                "veizik telemetry enable     turn sharing on later",
+                "veizik telemetry disable    turn sharing off at any time",
+                "veizik telemetry delete     erase local data and request server erasure",
+            ],
+            # Both actions proceed. The second is worded "continue without sharing" — not
+            # "No thanks" — so the screen itself states that declining is a full path forward.
+            "actions": ["Yes, share performance data", "No, continue without sharing"],
+            "no_lockout": (
+                "Choosing No does not limit any feature of your plan. Everything you have "
+                "purchased keeps working exactly the same."
+            ),
             "consent_version": CONSENT_VERSION,
         },
     }
@@ -1250,6 +1604,10 @@ if __name__ == "__main__":
         print(json.dumps(delete(), ensure_ascii=False, indent=2))
     elif cmd == "consent":
         print(json.dumps(consent_screen_text(), ensure_ascii=False, indent=2))
+    elif cmd == "benefits":
+        print(benefits_text())
+    elif cmd == "contributor":
+        print(contributor_report_text())
     elif cmd == "selftest":
         dirty = _scrub(
             build_report(
@@ -1286,9 +1644,24 @@ if __name__ == "__main__":
         if not is_enabled():
             assert record_run(result={"status": "ok"}) is None
 
+        # §5: two screens, and the decline action must be a full path forward.
+        cs = consent_screen_text()
+        assert cs["step_1"]["title"] == "Veizik license operation"
+        assert cs["step_1"]["actions"] == ["Continue"], "step 1 offers no choice by design"
+        assert cs["step_2"]["title"] == "Help improve hardware compatibility"
+        assert len(cs["step_2"]["actions"]) == 2
+        assert "without sharing" in cs["step_2"]["actions"][1]
+        assert "does not limit any feature" in cs["step_2"]["no_lockout"]
+
+        # §6 / (c): the community comparison must never carry a number.
+        rep = contributor_report()
+        assert rep["community"]["available"] is False
+        assert rep["community"]["median"] is None, "no fabricated median, ever"
+        assert COMMUNITY_COMPARISON_UNAVAILABLE in contributor_report_text()
+
         print("selftest OK")
     else:
         print(
-            "usage: veizik_telemetry.py "
-            "status|enable|disable|show-last|queue|send|export|delete|consent|selftest"
+            "usage: veizik_telemetry.py status|enable|disable|show-last|queue|send|export|"
+            "delete|consent|benefits|contributor|selftest"
         )

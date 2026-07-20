@@ -1,0 +1,170 @@
+{
+  "schema_version": "veizik-capsule-manifest-v1",
+  "capsule_id": "i2v-short",
+  "version": "1.0.0",
+  "display_name": "Image to video, short clip",
+  "summary": "Animates a single still into a short clip. The image carries the composition; the prompt describes the motion. This is the capsule to reach for when you already have a frame you like.",
+  "task": "i2v",
+  "model_family": "wan",
+  "model_family_fallbacks": ["ltx-video"],
+  "profile_hint": null,
+
+  "inputs": [
+    {
+      "name": "image",
+      "type": "image",
+      "required": true,
+      "description": "Single still. The first frame is conditioned on this. Read locally and never transmitted.",
+      "formats": ["png", "jpg", "jpeg", "webp"]
+    },
+    {
+      "name": "prompt",
+      "type": "text",
+      "required": true,
+      "description": "Describe the motion, not the still. The image already carries composition, subject and lighting; restating them wastes conditioning.",
+      "max_chars": 800
+    },
+    {
+      "name": "negative_prompt",
+      "type": "text",
+      "required": false,
+      "description": "Motion artifacts to suppress. Leave empty unless you are fixing a specific observed failure.",
+      "max_chars": 400
+    },
+    {
+      "name": "seed",
+      "type": "int",
+      "required": false,
+      "description": "Omit for a random seed. The drawn value is recorded in the sidecar either way, so any run can be repeated exactly.",
+      "min": 0,
+      "max": 4294967295
+    },
+    {
+      "name": "duration_s",
+      "type": "float",
+      "required": false,
+      "description": "Clip length in seconds. Frame count is derived from this and fps.",
+      "default": 3.0,
+      "min": 2.0,
+      "max": 5.0
+    }
+  ],
+
+  "params": {
+    "width": 832,
+    "height": 480,
+    "frames": 49,
+    "fps": 16,
+    "steps": 30,
+    "precision": "bf16",
+    "quantization": "none",
+    "attention_backend": "sdpa",
+    "sampler": null,
+    "guidance_scale": 5.0,
+    "seed_policy": "random",
+    "batch_size": 1,
+    "tile": "off",
+    "offload": "hot_window"
+  },
+
+  "outputs": [
+    {
+      "name": "video",
+      "type": "mp4",
+      "description": "H.264, yuv420p, so it plays everywhere without transcoding."
+    },
+    {
+      "name": "sidecar",
+      "type": "json",
+      "description": "Model id, weight hash, resolved profile id, drawn seed, and every resolved setting. Enough to reproduce this run exactly."
+    }
+  ],
+
+  "preflight": [
+    {
+      "check": "profile_resolves",
+      "threshold": null,
+      "unit": null,
+      "on_fail": "refuse",
+      "message": "No execution profile matches this GPU for the wan family or its fallbacks. Run `veizik doctor` to see the support tier for each family on this machine."
+    },
+    {
+      "check": "vram_headroom",
+      "threshold": 1024,
+      "unit": "mib",
+      "on_fail": "refuse",
+      "message": "Free VRAM is below the resolved profile's expected peak plus a 1 GiB working margin. Close other GPU work, or pick a capsule with a lower resolution."
+    },
+    {
+      "check": "disk_headroom",
+      "threshold": 2,
+      "unit": "gib",
+      "on_fail": "refuse",
+      "message": "Less than 2 GiB free on the output volume. The clip and its intermediates will not fit."
+    },
+    {
+      "check": "input_decodable",
+      "threshold": null,
+      "unit": null,
+      "on_fail": "refuse",
+      "message": "The input image could not be decoded, or its pixel format is unsupported. Checked before any weights are loaded so the failure costs seconds rather than minutes."
+    },
+    {
+      "check": "input_dimensions",
+      "threshold": 256,
+      "unit": "px",
+      "on_fail": "warn",
+      "message": "The input image is smaller than 256 px on its short edge. It will be upscaled to the render resolution, which usually reads as soft."
+    }
+  ],
+
+  "qc": {
+    "criteria": [
+      {
+        "metric": "nan_or_inf",
+        "comparator": "eq",
+        "threshold": 0,
+        "enforce": true,
+        "note": "A non-finite value in the output latents means the render is garbage. This is the one criterion worth failing the run over, because there is nothing for the operator to judge."
+      },
+      {
+        "metric": "black_frame_ratio",
+        "comparator": "lt",
+        "threshold": 0.1,
+        "enforce": false,
+        "note": "More than 10 percent fully black frames is the classic i2v collapse. Flagged, not failed — a deliberate fade to black is a legitimate result."
+      },
+      {
+        "metric": "static_frame_ratio",
+        "comparator": "lt",
+        "threshold": 0.9,
+        "enforce": false,
+        "note": "A near-frozen clip usually means the motion prompt was ignored. Try a more explicit verb before raising the step count."
+      },
+      {
+        "metric": "frame_count",
+        "comparator": "eq",
+        "threshold": 49,
+        "enforce": false,
+        "note": "Guards against a truncated write. A mismatch here points at the encoder rather than the model."
+      }
+    ],
+    "on_violation": "warn"
+  },
+
+  "required_tier": "founding_creator",
+  "commercial_use": true,
+
+  "status": "development",
+  "status_note": "The definition is complete and stable, and the parameters below are what the runtime will use. Execution is NOT shipped: the native engine path for this capsule is not in the public download, and the public experimental backend covers universal t2v/t2i only (Linux + NVIDIA, with a torch/diffusers environment you supply). Read this file as a contract, not as a feature you can run today.",
+
+  "timing": {
+    "measurement_status": "measurement in progress",
+    "expected_wall_s": null,
+    "expected_peak_vram_mb": null,
+    "reference_hardware": null,
+    "start_mode": null
+  },
+
+  "notes": "Prompt the motion, not the picture. The two most common failure modes are a static clip (verb too vague) and drift away from the input identity late in the clip (shorten duration_s before raising steps). No timing figure appears in this file, because none has been measured under the published benchmark method and reproduced."
+}

@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://veizik.com/schemas/capsule-manifest-v1.json",
+  "title": "Veizik Capsule Manifest v1",
+  "description": "A Capsule is a named, reproducible job shape: what the user supplies, which model family runs it, what settings it runs at, what must be true before the GPU is touched, and what comes out. Capsules are declarative data, not code — this schema defines the contract; the runtime that executes it is a separate concern, and a capsule may be fully defined long before its execution path ships. That gap is why `status` is mandatory. Like run-report-v1, this schema is an allowlist: additionalProperties is false at every level, so an unrecognized field is a validation failure rather than a silently ignored one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "capsule_id",
+    "version",
+    "display_name",
+    "task",
+    "model_family",
+    "inputs",
+    "params",
+    "outputs",
+    "required_tier",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Schema discriminator. Loaders route on this value and refuse anything they do not recognize.",
+      "const": "veizik-capsule-manifest-v1"
+    },
+
+    "capsule_id": {
+      "description": "Stable machine identifier, unique within a pack. This is what `veizik run <capsule>` takes, so it is part of the public surface and must not change once published. Rename by publishing a new id and marking the old one deprecated.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$"
+    },
+    "version": {
+      "description": "Semantic version of this capsule definition. Bump the minor for additive parameter changes and the major whenever a default changes in a way that alters output for an unchanged invocation — a user who pins a version is pinning reproducibility.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "display_name": {
+      "description": "Short human-readable label shown in listings. One line, no trailing punctuation.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "summary": {
+      "description": "One or two sentences on what this capsule is for and when to reach for it. Shown to the user before they spend GPU time.",
+      "type": ["string", "null"],
+      "maxLength": 600
+    },
+    "deprecated": {
+      "description": "True when this capsule is retained for compatibility but should not be used for new work. Pair with `superseded_by`.",
+      "type": ["boolean", "null"]
+    },
+    "superseded_by": {
+      "description": "capsule_id that replaces this one, when deprecated.",
+      "type": ["string", "null"]
+    },
+
+    "task": {
+      "description": "Job class. Determines which inputs are meaningful and how the output is interpreted.",
+      "type": "string",
+      "enum": ["i2v", "t2v", "t2i"]
+    },
+    "model_family": {
+      "description": "Primary model family this capsule targets, e.g. \"wan\", \"ltx-video\", \"cogvideox\", \"sdxl\". A family, never a local path and never a user-named model directory.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"
+    },
+    "model_family_fallbacks": {
+      "description": "Ordered fallback families, most preferred first. Used when no execution profile resolves for the primary family on this machine. An empty array means: fail rather than substitute a different model behind the user's back.",
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"
+      }
+    },
+    "profile_hint": {
+      "description": "Optional preferred execution profile id. A hint only — the resolver may pick a different profile to fit this machine, and must say so when it does.",
+      "type": ["string", "null"]
+    },
+
+    "inputs": {
+      "description": "What the user supplies. Order is presentation order. Every input the capsule reads must be declared here; the runtime rejects arguments it cannot find in this list rather than passing them through.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type", "required"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$"
+          },
+          "type": {
+            "description": "Input kind. `image`/`video`/`audio` are file references resolved locally and never transmitted.",
+            "type": "string",
+            "enum": ["image", "video", "audio", "text", "int", "float", "bool", "enum"]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": ["string", "null"],
+            "maxLength": 400
+          },
+          "default": {
+            "description": "Default applied when the input is omitted. Must be absent for required inputs.",
+            "type": ["string", "number", "boolean", "null"]
+          },
+          "max_chars": {
+            "description": "Upper bound for text inputs.",
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": 100000
+          },
+          "min": {
+            "description": "Inclusive lower bound for int and float inputs.",
+            "type": ["number", "null"]
+          },
+          "max": {
+            "description": "Inclusive upper bound for int and float inputs.",
+            "type": ["number", "null"]
+          },
+          "values": {
+            "description": "Allowed values for enum inputs.",
+            "type": ["array", "null"],
+            "minItems": 1,
+            "maxItems": 64,
+            "items": {"type": "string"}
+          },
+          "formats": {
+            "description": "Accepted container or codec formats for file inputs, lowercase and without a leading dot.",
+            "type": ["array", "null"],
+            "maxItems": 32,
+            "items": {"type": "string", "pattern": "^[a-z0-9]{1,12}$"}
+          }
+        }
+      }
+    },
+
+    "params": {
+      "description": "Resolved render settings for this capsule. These are the values recorded in the output sidecar and, when the user consents to performance reporting, the shape fields mirrored into a run report. Anything omitted is decided by the resolved execution profile at run time and must still be written to the sidecar.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "height": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "frames": {
+          "description": "Frame count. 1 or null for image tasks.",
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "fps": {
+          "description": "Playback frame rate of the produced clip.",
+          "type": ["number", "null"],
+          "minimum": 1,
+          "maximum": 240
+        },
+        "steps": {
+          "description": "Sampler step count.",
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "precision": {
+          "description": "Compute dtype. Values match run-report-v1 so a capsule and its reports are directly comparable.",
+          "type": ["string", "null"],
+          "enum": ["fp32", "tf32", "bf16", "fp16", "fp8", "mixed", "unknown", null]
+        },
+        "quantization": {
+          "type": ["string", "null"],
+          "enum": ["none", "int8", "int8_smoothquant", "int4", "fp8", "mixed", "unknown", null]
+        },
+        "attention_backend": {
+          "type": ["string", "null"],
+          "enum": ["sdpa", "flash_attn", "flash_attn_2", "xformers", "native", "math", "unknown", null]
+        },
+        "sampler": {
+          "description": "Sampler or scheduler name. Part of reproducibility: the same seed under a different sampler is a different render.",
+          "type": ["string", "null"]
+        },
+        "guidance_scale": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "shift": {
+          "description": "Flow-matching timestep shift, where the family uses one.",
+          "type": ["number", "null"]
+        },
+        "seed_policy": {
+          "description": "How the seed is chosen when the user does not supply one. `random` still records the drawn seed in the sidecar, so any run remains repeatable.",
+          "type": ["string", "null"],
+          "enum": ["random", "fixed", "derived", null]
+        },
+        "fixed_seed": {
+          "description": "Seed used when seed_policy is `fixed`.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "batch_size": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "tile": {
+          "description": "Tiling configuration as a shape descriptor, e.g. \"512x512\", or \"off\".",
+          "type": ["string", "null"]
+        },
+        "offload": {
+          "description": "Weight placement strategy requested by this capsule. The profile may override it to fit the machine.",
+          "type": ["string", "null"],
+          "enum": ["none", "cpu", "sequential", "disk", "hot_window", "unknown", null]
+        }
+      }
+    },
+
+    "outputs": {
+      "description": "What lands on disk. A `sidecar` output carrying the fully resolved settings is strongly recommended for every capsule — without it a run cannot be reproduced.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["mp4", "webm", "mov", "png", "jpg", "webp", "wav", "json"]
+          },
+          "description": {
+            "type": ["string", "null"],
+            "maxLength": 400
+          }
+        }
+      }
+    },
+
+    "preflight": {
+      "description": "Conditions checked before any weights are loaded. The design rule is to fail early and specifically wherever a failure is knowable in advance, rather than discovering it as an OOM twenty minutes into a render.",
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check"],
+        "properties": {
+          "check": {
+            "type": "string",
+            "enum": [
+              "profile_resolves",
+              "vram_headroom",
+              "ram_headroom",
+              "disk_headroom",
+              "input_decodable",
+              "input_dimensions",
+              "model_present",
+              "license_tier",
+              "concurrency_slot"
+            ]
+          },
+          "threshold": {
+            "description": "Numeric bound for the check, in the unit named by `unit`. Null for checks that are purely structural.",
+            "type": ["number", "null"]
+          },
+          "unit": {
+            "type": ["string", "null"],
+            "enum": ["mib", "gib", "px", "count", "ratio", null]
+          },
+          "on_fail": {
+            "description": "`refuse` stops before the GPU is touched. `warn` proceeds but records the condition in the sidecar. `downgrade` permits the resolver to select a lighter profile, which must be reported to the user.",
+            "type": ["string", "null"],
+            "enum": ["refuse", "warn", "downgrade", null]
+          },
+          "message": {
+            "description": "Operator-facing explanation naming the specific unmet condition and the setting that would resolve it.",
+            "type": ["string", "null"],
+            "maxLength": 400
+          }
+        }
+      }
+    },
+
+    "qc": {
+      "description": "Automated acceptance criteria applied to the produced output. QC is advisory by default: it flags a suspect render rather than deleting it, because the operator is the final judge of a creative result. A criterion with enforce=true may fail the run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criteria"],
+      "properties": {
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["metric", "comparator", "threshold"],
+            "properties": {
+              "metric": {
+                "description": "What is measured. `black_frame_ratio` and `static_frame_ratio` catch the common collapse modes cheaply; `identity_similarity` applies only where a reference face is supplied.",
+                "type": "string",
+                "enum": [
+                  "black_frame_ratio",
+                  "static_frame_ratio",
+                  "temporal_flicker",
+                  "motion_magnitude",
+                  "output_bytes",
+                  "output_duration_s",
+                  "frame_count",
+                  "nan_or_inf",
+                  "identity_similarity",
+                  "sharpness"
+                ]
+              },
+              "comparator": {
+                "type": "string",
+                "enum": ["lt", "lte", "gt", "gte", "eq", "neq"]
+              },
+              "threshold": {
+                "type": "number"
+              },
+              "enforce": {
+                "description": "True makes a violation fail the run. False (the default) records the violation in the sidecar and warns.",
+                "type": ["boolean", "null"]
+              },
+              "note": {
+                "type": ["string", "null"],
+                "maxLength": 400
+              }
+            }
+          }
+        },
+        "on_violation": {
+          "description": "What happens when an enforced criterion fails. `retry_once` re-runs with a new seed at most once, which costs GPU time and must be opt-in per capsule.",
+          "type": ["string", "null"],
+          "enum": ["warn", "fail", "retry_once", null]
+        }
+      }
+    },
+
+    "required_tier": {
+      "description": "Minimum plan that may run this capsule. Values match run-report-v1. This field is a declaration for display and local pre-checks; the authoritative entitlement decision is made by the server, not by reading this field (see SECURITY.md).",
+      "type": "string",
+      "enum": [
+        "starter_preview",
+        "founding_creator",
+        "founding_pro_runtime_pass",
+        "studio_node"
+      ]
+    },
+    "commercial_use": {
+      "description": "Whether output from this capsule may be used commercially under the tier that ran it. Starter Preview excludes commercial use regardless of this field.",
+      "type": ["boolean", "null"]
+    },
+
+    "status": {
+      "description": "Delivery state of the EXECUTION PATH for this capsule, which is frequently behind the definition. Required, and required to be accurate: a complete definition whose runtime has not shipped is `research` or `development`, never `shipped`. Publishing an unshipped capsule as shipped is treated as a defect.",
+      "type": "string",
+      "enum": [
+        "research",
+        "development",
+        "private_preview",
+        "public_preview",
+        "shipped"
+      ]
+    },
+    "status_note": {
+      "description": "Plain-language statement of what actually runs today and what does not. Required reading for anyone consuming a non-shipped capsule.",
+      "type": ["string", "null"],
+      "maxLength": 1000
+    },
+
+    "timing": {
+      "description": "Expected wall-clock cost. Every field here is null until a figure has been measured under the published benchmark method and independently reproduced. An unmeasured capsule carries measurement_status \"measurement in progress\" — it does not carry an estimate, because a plausible-looking estimate is indistinguishable from a claim.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurement_status"],
+      "properties": {
+        "measurement_status": {
+          "type": "string",
+          "enum": ["measurement in progress", "internal", "externally reproduced"]
+        },
+        "expected_wall_s": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "expected_peak_vram_mb": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "reference_hardware": {
+          "description": "GPU the figures above were taken on. Meaningless without it.",
+          "type": ["string", "null"]
+        },
+        "start_mode": {
+          "description": "Cold and warm timings are not comparable and are never mixed in one figure.",
+          "type": ["string", "null"],
+          "enum": ["cold", "warm", null]
+        }
+      }
+    },
+
+    "notes": {
+      "description": "Free-form operator notes: quality caveats, known interactions, guidance on when the capsule is the wrong tool.",
+      "type": ["string", "null"],
+      "maxLength": 2000
+    }
+  }
+}
