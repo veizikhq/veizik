@@ -1,9 +1,9 @@
 # Veizik
 
-**A hardware-aware local AI media runtime.** Veizik checks your GPU and picks a runnable
-profile so large AI video models run locally, without manual memory tuning. Rendering
-happens on hardware you own — no cloud render service, and your media and prompts stay on
-your machine. Powered by the LimML engine.
+**Run local AI media workloads with hardware-aware compatibility checks and execution
+profiles.** Veizik checks your GPU and reports a runnable support tier and recommended
+execution profile. Rendering happens on hardware you own — no cloud render service, and
+your media and prompts stay on your machine. Powered by the LimML engine.
 
 This README describes only what the **public download actually does**. Anything not yet in
 the download is labeled as planned or experimental, on purpose.
@@ -123,8 +123,8 @@ Full details at [veizik.com/#pricing](https://veizik.com/#pricing).
 | Plan | Price |
 | --- | --- |
 | Free Preview | $0 — install, hardware check, free entitlement, experimental render |
-| Founding Creator | $9 / mo — first 100 paid subscribers |
-| Pro / Studio | opens after Preview validation |
+| Founding Creator | **$9 / mo — checkout live** — first 100 paid subscribers, price locked 12 months |
+| Pro / Studio | not currently available — opens after Preview validation |
 
 ### Founding 100
 
