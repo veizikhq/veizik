@@ -1,0 +1,26 @@
+Veizik Distribution License (source-available, proprietary)
+
+Copyright (c) 2026 Veizik. All rights reserved.
+
+The files in this repository are provided so that users can install, inspect,
+and run the Veizik client on their own hardware.
+
+You MAY:
+  * download, install, and run this software on hardware you control;
+  * read and audit the source in this repository;
+  * modify it locally for your own use (e.g. debugging, integration).
+
+You MAY NOT:
+  * redistribute this software or derivatives as a competing product or service;
+  * wrap it as a paid hosted service (SaaS / render farm) without a written
+    business license;
+  * remove or circumvent licensing, entitlement, or watermarking mechanisms;
+  * share, pool, or resell API keys or entitlement tokens.
+
+The software is gated by a server-signed entitlement from veizik.com. The code
+installs freely; product features are governed by your plan's terms at
+https://veizik.com/terms.html.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT
+SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM THE USE OF THE SOFTWARE.
