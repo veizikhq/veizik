@@ -187,6 +187,21 @@ def cmd_logout(args):
     return 0
 
 
+def _pack_files_intact(vp, pack_id):
+    """True when the pack's files on disk still match the digests recorded at install.
+
+    Used so `pack install` repairs a tampered/corrupted pack instead of reporting it as current.
+    Any doubt returns False (reinstall is always safe — it re-verifies the signature).
+    """
+    try:
+        for row in vp.verify_installed():
+            if row.get("pack_id") == pack_id:
+                return bool(row.get("ok"))
+    except Exception:
+        pass
+    return False
+
+
 def cmd_verify(args):
     """Prove you control the license email, so a payment binds to THIS key.
 
@@ -1733,6 +1748,105 @@ def _pack_reality_note():
             "  distributable and are in no pack. Render-time figures: measurement in progress.")
 
 
+def _pack_install_results(vp, pack_id, tier, dry_run):
+    """Adapt veizik_packs' install API to one uniform result list for printing.
+
+    veizik_packs.install() takes a single verified manifest ENTRY and raises on
+    refusal, while ensure_for_tier() syncs everything the tier allows and returns
+    installed/skipped/failed buckets. The CLI wants one flat list either way, and
+    it must NOT re-implement any of the checks — every decision below still comes
+    out of veizik_packs, which is where the security properties live.
+    """
+    if pack_id:
+        doc = vp.fetch_manifest()
+        src = doc.get("_source") or vp.manifest_url()
+        entry = next((e for e in doc.get("packs", [])
+                      if isinstance(e, dict) and str(e.get("pack_id") or "") == pack_id), None)
+        if entry is None:
+            known = ", ".join(sorted(str(e.get("pack_id")) for e in doc.get("packs", [])
+                                     if isinstance(e, dict))) or "(none)"
+            raise vp.PackError("no pack named %r in the manifest. Available: %s" % (pack_id, known))
+        cur = vp.installed().get(pack_id)
+        if cur and cur.get("version") == entry.get("version") \
+                and cur.get("sha256") == str(entry.get("sha256") or "").lower() \
+                and _pack_files_intact(vp, pack_id):
+            # Matching version+sha is not enough: if the files on disk were modified since install,
+            # `pack verify` tells the user to reinstall, so install must actually repair rather than
+            # short-circuit — otherwise the remediation we print is a dead end.
+            return [{"pack_id": pack_id, "action": "already-current", "version": cur.get("version")}]
+        try:
+            if dry_run:
+                # The signature is verified even for --dry-run: "what would happen"
+                # is only a useful answer if it reflects the real gate.
+                signed = vp.verify_entry(entry)
+                return [{"pack_id": pack_id, "action": "would-install",
+                         "version": signed["version"], "tier": signed["tier"]}]
+            rec = vp.install(entry, tier=tier, manifest_src=src)
+        except vp.PackError as exc:
+            return [{"pack_id": pack_id, "action": "refused", "reason": str(exc)}]
+        return [{"pack_id": pack_id, "action": "installed", "version": rec["version"],
+                 "tier": rec["tier"], "files": len(rec.get("files") or {}),
+                 "path": rec.get("path", "")}]
+
+    res = vp.ensure_for_tier(tier, dry_run=dry_run)
+    out = []
+    seen = set()
+    for item in res.get("installed", []):
+        pid = item["pack_id"]
+        seen.add(pid)
+        if item.get("planned"):
+            out.append({"pack_id": pid, "action": "would-install",
+                        "version": item.get("version"), "tier": item.get("tier")})
+            continue
+        rec = vp.installed().get(pid, {})
+        out.append({"pack_id": pid, "action": "installed", "version": item.get("version"),
+                    "tier": rec.get("tier", tier), "files": len(rec.get("files") or {}),
+                    "path": rec.get("path", "")})
+    for item in res.get("skipped", []):
+        pid = item["pack_id"]
+        seen.add(pid)
+        if item.get("reason") == "already current":
+            out.append({"pack_id": pid, "action": "already-current", "version": item.get("version")})
+        else:
+            # 'above tier' — say which plan covers it and where to get it.
+            out.append({"pack_id": pid, "action": "refused",
+                        "reason": "%s is a %s pack and your licence is %s.\n"
+                                  "  Upgrade at %s, then run:  veizik activate <YOUR_KEY>"
+                                  % (pid, vp.TIER_LABEL.get(item.get("tier"), item.get("tier")),
+                                     vp.TIER_LABEL.get(tier, tier), vp.UPGRADE_URL)})
+    for item in res.get("failed", []):
+        seen.add(item.get("pack_id", "?"))
+        out.append({"pack_id": item.get("pack_id", "?"), "action": "refused",
+                    "reason": item.get("error", "unknown error")})
+
+    # Reconcile against the RAW manifest. ensure_for_tier() builds its worklist from
+    # manifest_entries(), which DROPS entries that fail signature or shape validation
+    # — correct for installing (a poisoned entry must not stop the packs you paid
+    # for), but it means a wholly tampered manifest would otherwise surface here as a
+    # cheerful "nothing to install". That is the one message a user must never get
+    # when their mirror is hostile, so re-verify anything unaccounted for and report
+    # the real reason. Nothing is installed on this path; it only turns silence into
+    # an explanation.
+    try:
+        doc = vp.fetch_manifest()
+    except vp.PackError:
+        return out                           # transport failure already reported above
+    for entry in doc.get("packs", []):
+        if not isinstance(entry, dict):
+            continue
+        pid = str(entry.get("pack_id") or "?")
+        if pid in seen:
+            continue
+        try:
+            vp.verify_entry(entry)
+            reason = ("entry verified but was not offered for install on this tier "
+                      "(it may be superseded by another entry for the same pack)")
+        except vp.PackError as exc:
+            reason = str(exc)
+        out.append({"pack_id": pid, "action": "refused", "reason": reason})
+    return out
+
+
 def cmd_pack(args):
     vp = _packs()
     act = getattr(args, "pack_action", None) or "list"
@@ -1774,11 +1888,14 @@ def cmd_pack(args):
         for row in table:
             print(fmt(row))
         for r in rows:
-            print("\n  %s %s — %s" % (r["pack_id"], r["version"], r["summary"] or "(no summary)"))
+            # `summary` / `contains` / `unlocks` are NOT covered by the pack signature, so a hostile
+            # mirror could use them to describe a config pack as a native-kernel pack. Print them
+            # only with an explicit (unverified) marker, never flush against "signature: verified".
+            print("\n  %s %s" % (r["pack_id"], r["version"]))
+            if r["summary"]:
+                print("    (unverified description)  %s" % r["summary"])
             if r["contains"]:
-                print("    contains  %s" % ", ".join(r["contains"]))
-            if r["unlocks"]:
-                print("    unlocks   %s" % ", ".join(r["unlocks"]))
+                print("    (unverified)  claims to contain: %s" % ", ".join(r["contains"]))
             if not r["signature_ok"]:
                 print("    REFUSED   %s" % r["reason"])
         print("\n[pack] %s" % _pack_reality_note())
@@ -1790,8 +1907,8 @@ def cmd_pack(args):
         _banner()
         print("\n[pack] licence: %s" % label)
         try:
-            results = vp.install(getattr(args, "pack_id", None), tier,
-                                 dry_run=getattr(args, "dry_run", False))
+            results = _pack_install_results(vp, getattr(args, "pack_id", None), tier,
+                                            getattr(args, "dry_run", False))
         except vp.PackError as e:
             print("\n[pack] %s" % e)
             return 3
@@ -1813,10 +1930,14 @@ def cmd_pack(args):
                 print("\n[pack] refused %s:\n  %s" % (pid, res["reason"]))
         if not results:
             print("\n[pack] nothing to install.")
+        # Say what installing actually did — nothing is "unlocked" until the render path consults
+        # these packs, and today it does not. Claiming otherwise contradicts `veizik feature`.
         unlocked = vp.unlocked_features()
         if unlocked:
-            print("\n[pack] features now unlocked: %s"
+            print("\n[pack] installed data now available to the runtime: %s"
                   % ", ".join("%s (%s)" % (f, p) for f, p in sorted(unlocked.items())))
+            print("[pack] note: these are execution profiles and capsule definitions. The render"
+                  "\n       path does not consume them yet — that lands with the native engine pack.")
         print("\n[pack] %s" % _pack_reality_note())
         # A refusal is a real, actionable answer (wrong tier, bad signature, downgrade attempt),
         # not a crash — distinct exit code so scripts can tell it from a transport failure.
