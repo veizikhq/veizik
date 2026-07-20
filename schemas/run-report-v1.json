@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://veizik.com/schemas/run-report-v1.json",
+  "title": "Veizik Run Report v1",
+  "description": "Optional performance and compatibility report emitted by the Veizik CLI after a render completes. Sent only with explicit Category B consent (see TELEMETRY.md). This schema is an allowlist: additionalProperties is false at every level, so any field not named here is a validation failure rather than silently accepted data. The server rejects reports whose privacy object is not four false values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "installation_id",
+    "license_tier",
+    "telemetry_consent_version",
+    "runtime",
+    "hardware",
+    "workload",
+    "result",
+    "privacy"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Schema discriminator. Ingestion routes on this value.",
+      "const": "veizik-run-report-v1"
+    },
+    "event_id": {
+      "description": "Unique id for this report, used for idempotent ingestion and de-duplication of retried batches.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "installation_id": {
+      "description": "Pseudonymous installation identifier (hex hash). Not anonymous: it is stable and may be associable with a license, and is therefore treated as pseudonymized personal data under PIPA and the GDPR. This is the key used to honor deletion requests.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32,64}$"
+    },
+    "license_tier": {
+      "description": "Plan under which the run executed.",
+      "type": "string",
+      "enum": [
+        "starter_preview",
+        "founding_creator",
+        "founding_pro_runtime_pass",
+        "studio_node"
+      ]
+    },
+    "telemetry_consent_version": {
+      "description": "Version of the optional-performance-data consent text the user accepted. Reports carrying a consent version that is no longer valid for the collected fields are rejected.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+
+    "runtime": {
+      "description": "Which Veizik build and which loaded components executed the run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["veizik_version", "execution_backend"],
+      "properties": {
+        "veizik_version": {
+          "description": "Version of the bootstrap CLI.",
+          "type": "string"
+        },
+        "adapter_id": {
+          "description": "Model Adapter identifier, or null when no adapter was loaded.",
+          "type": ["string", "null"]
+        },
+        "capsule_id": {
+          "description": "Capsule identifier, or null when the run was not capsule-driven.",
+          "type": ["string", "null"]
+        },
+        "execution_backend": {
+          "description": "Execution path used for this run.",
+          "type": "string",
+          "enum": ["universal", "native", "comfyui", "unknown"]
+        },
+        "profile_id": {
+          "description": "Hardware-aware runtime profile selected for this machine.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "hardware": {
+      "description": "Machine capability class. Bucketed where a raw value would add identifiability without adding compatibility signal.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu_vendor", "gpu_model", "vram_mb", "gpu_count", "os_major"],
+      "properties": {
+        "gpu_vendor": {
+          "type": "string",
+          "enum": ["nvidia", "amd", "intel", "apple", "none", "unknown"]
+        },
+        "gpu_model": {
+          "description": "Marketing model string as reported by the driver, e.g. \"NVIDIA GeForce RTX 3090\".",
+          "type": "string"
+        },
+        "vram_mb": {
+          "description": "VRAM of a single GPU, in MiB.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "gpu_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "gpu_architecture": {
+          "description": "Architecture or compute capability, e.g. \"ampere\", \"sm_86\".",
+          "type": ["string", "null"]
+        },
+        "driver_version": {
+          "type": ["string", "null"]
+        },
+        "cuda_version": {
+          "description": "CUDA runtime version, or null on non-CUDA machines.",
+          "type": ["string", "null"]
+        },
+        "os_major": {
+          "description": "OS family and major version only, e.g. \"linux-6\", \"windows-11\", \"macos-15\". Never a full build string.",
+          "type": "string"
+        },
+        "cpu_class": {
+          "description": "CPU class rather than exact SKU, e.g. \"x86_64-16c\", \"apple-m3-max\".",
+          "type": ["string", "null"]
+        },
+        "ram_band": {
+          "description": "System RAM as a bucket, not an exact figure.",
+          "type": ["string", "null"],
+          "enum": ["<16GB", "16-32GB", "32-64GB", "64-128GB", "128-256GB", ">256GB", null]
+        },
+        "storage_class": {
+          "type": ["string", "null"],
+          "enum": ["nvme", "ssd", "hdd", "network", "unknown", null]
+        },
+        "power_limit_w": {
+          "description": "GPU power cap in watts, when readable. Materially affects render throughput.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 2000
+        },
+        "form_factor": {
+          "type": ["string", "null"],
+          "enum": ["desktop", "laptop", "server", "vm", "unknown", null]
+        }
+      }
+    },
+
+    "workload": {
+      "description": "What was asked of the runtime. Describes the shape of the job only; never its content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "precision", "steps"],
+      "properties": {
+        "model_id": {
+          "description": "Public model identifier, e.g. \"ltx-video-13b\". Never a local path and never a private or user-named model directory.",
+          "type": "string"
+        },
+        "model_hash": {
+          "description": "Hash of the model weights, used to distinguish revisions of the same public id.",
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{8,64}$"
+        },
+        "precision": {
+          "type": "string",
+          "enum": ["fp32", "tf32", "bf16", "fp16", "fp8", "mixed", "unknown"]
+        },
+        "quantization": {
+          "type": ["string", "null"],
+          "enum": ["none", "int8", "int8_smoothquant", "int4", "fp8", "mixed", "unknown", null]
+        },
+        "attention_backend": {
+          "type": ["string", "null"],
+          "enum": ["sdpa", "flash_attn", "flash_attn_2", "xformers", "native", "math", "unknown", null]
+        },
+        "width": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "height": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "frames": {
+          "description": "Frame count. 1 or null for image workloads.",
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "batch_size": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "tile": {
+          "description": "Tiling configuration as a shape descriptor, e.g. \"512x512\", or \"off\".",
+          "type": ["string", "null"]
+        },
+        "offload": {
+          "type": ["string", "null"],
+          "enum": ["none", "cpu", "sequential", "disk", "hot_window", "unknown", null]
+        },
+        "concurrent_jobs": {
+          "description": "Number of Veizik jobs running on this node at dispatch time.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "start_mode": {
+          "description": "Whether weights were already resident. Cold and warm runs are not comparable.",
+          "type": ["string", "null"],
+          "enum": ["cold", "warm", "unknown", null]
+        }
+      }
+    },
+
+    "result": {
+      "description": "What actually happened. Failure reports are as valuable as successful ones and are collected the same way.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "wall_ms", "status"],
+      "properties": {
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "wall_ms": {
+          "description": "Total wall-clock duration in milliseconds.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_load_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "denoise_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "vae_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "postprocess_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "peak_vram_mb": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "peak_ram_mb": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "avg_gpu_util_pct": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "power_draw_w": {
+          "description": "Average GPU power draw in watts. Optional; omitted or null where unreadable.",
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 2000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "failure", "cancelled"]
+        },
+        "error_code": {
+          "description": "Stable Veizik error code, e.g. \"E_OOM_DENOISE\". Never a raw exception message, stack trace, or path.",
+          "type": ["string", "null"],
+          "pattern": "^[A-Z0-9_]{2,64}$"
+        },
+        "stopped_stage": {
+          "description": "Pipeline stage at which the run stopped, for failed or cancelled runs.",
+          "type": ["string", "null"],
+          "enum": ["init", "model_load", "encode", "denoise", "vae", "postprocess", "write", "unknown", null]
+        },
+        "oom": {
+          "description": "True if the run hit an out-of-memory condition at any stage.",
+          "type": ["boolean", "null"]
+        },
+        "recovered": {
+          "description": "True if a Recover / TimeMachine path resumed the run after a fault.",
+          "type": ["boolean", "null"]
+        },
+        "user_cancelled": {
+          "description": "True if the operator interrupted the run.",
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+
+    "product_signals": {
+      "description": "Optional coarse usage counters. Counters only; no content, no per-invocation arguments.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "first_success": {
+          "description": "True on the report for this installation's first successful render. Also starts the Starter Preview trial window, which begins at first successful render rather than at activation.",
+          "type": ["boolean", "null"]
+        },
+        "cumulative_successes": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "days_used": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "feature_use_counts": {
+          "description": "Map of feature name to invocation count, e.g. {\"queue\": 12, \"recover\": 1}.",
+          "type": ["object", "null"],
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9_]{1,64}$"
+          }
+        },
+        "preview_requested": {
+          "type": ["boolean", "null"]
+        },
+        "pro_interest": {
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+
+    "privacy": {
+      "description": "Client-side attestation that no user content is present in this report. Every member is const false. A report asserting otherwise is REJECTED at ingestion rather than sanitized and stored, so an accidental content leak becomes a hard failure instead of a silent data spill.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contains_prompt",
+        "contains_input",
+        "contains_output",
+        "contains_local_path"
+      ],
+      "properties": {
+        "contains_prompt": {
+          "description": "Prompt or negative-prompt text. Must be false.",
+          "const": false
+        },
+        "contains_input": {
+          "description": "Input image, video, or audio content. Must be false.",
+          "const": false
+        },
+        "contains_output": {
+          "description": "Generated output, including thumbnails and single frames. Must be false.",
+          "const": false
+        },
+        "contains_local_path": {
+          "description": "Filesystem paths, filenames, usernames, or hostnames. Must be false.",
+          "const": false
+        }
+      }
+    }
+  }
+}

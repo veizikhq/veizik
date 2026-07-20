@@ -74,6 +74,11 @@ def _ent():
     return ve
 
 
+def _tel():
+    import veizik_telemetry as vt
+    return vt
+
+
 def _gate_paid(feature, label):
     """Gate a paid-only feature (TimeMachine branch/fanout). Returns None if allowed, else prints an
     upgrade notice and returns an exit code. Free/entry tiers don't get these."""
@@ -99,6 +104,70 @@ def cmd_login(args):
               file=sys.stderr)
         return 1
     print("[login] activated — %s" % ve.status_line(ent))
+    # First activation on this machine -> show the two-step consent screens exactly once.
+    # Declining step 2 changes nothing about what you just bought.
+    _consent_flow()
+    return 0
+
+
+def cmd_activate(args):
+    """`veizik activate <KEY>` — alias of `veizik login <KEY>` (identical behaviour). Kept because
+    'activate' is the word on the purchase receipt."""
+    return cmd_login(args)
+
+
+# ---------------------------------------------------------------------------------------------------
+#   first-run consent — TWO SEPARATE SCREENS, never merged.
+#     step 1: license operating data. Necessary to deliver the service -> informational, no choice.
+#     step 2: optional performance/compatibility data -> a real Yes/No, both of which proceed.
+#   Declining step 2 NEVER locks a purchased feature (GDPR Art.7(4) / Korea PIPA).
+# ---------------------------------------------------------------------------------------------------
+def _consent_flow(force=False):
+    try:
+        vt = _tel()
+    except Exception as e:
+        print("[consent] telemetry module unavailable (%s) — continuing without it." % type(e).__name__)
+        return 0
+    if vt.consent_asked() and not force:
+        return 0
+
+    print("\n" + "-" * 78)
+    print(" 1/2  License operating data — required to run veizik")
+    print("-" * 78)
+    print("  To validate your license and your concurrent-node lease, veizik processes:")
+    print("    - license id / hash")
+    print("    - a PSEUDONYMOUS device identifier (a local random id, hashed; not your")
+    print("      hostname, MAC address or user name)")
+    print("    - your plan, app + protocol version, activation state, last verification time,")
+    print("      run lease and expiry, subscription state")
+    print("  This is the minimum needed to deliver the product you licensed, so it is not")
+    print("  optional and is not used for analytics or marketing.")
+    try:
+        input("\n  Press Enter to continue... ")
+    except EOFError:
+        print("\n  (non-interactive) continuing.")
+
+    print("\n" + "-" * 78)
+    print(" 2/2  Optional: performance & compatibility data")
+    print("-" * 78)
+    print("  Separate and entirely optional. It helps us tune VRAM planning and GPU support:")
+    for name, detail in vt.COLLECTED:
+        print("    %-16s %s" % (name + ":", detail))
+    print("\n  Never collected:")
+    print("    " + "; ".join(vt.NEVER_COLLECTED))
+    print("\n  %s" % vt.retention_note())
+    print("  Saying No changes NOTHING about the features on your plan. You can change this")
+    print("  any time with `veizik telemetry enable` / `veizik telemetry disable`.")
+    ans = ""
+    try:
+        ans = input("\n  Share optional performance data? [y/N] ").strip().lower()
+    except EOFError:
+        ans = ""
+    yes = ans in ("y", "yes")
+    vt.set_consent(yes)
+    print("  -> optional performance telemetry %s (consent version %s)"
+          % ("ENABLED — thank you" if yes else "DISABLED", vt.CONSENT_VERSION))
+    print("-" * 78)
     return 0
 
 
@@ -1257,6 +1326,322 @@ def cmd_oracle(args):
 
 
 # ---------------------------------------------------------------------------------------------------
+#   veizik telemetry  (status | enable | disable | show-last | queue | send | export | delete)
+#   The optional performance/compatibility channel ONLY. License operating data is a separate class
+#   handled by veizik_entitlement against a separate API, and is not governed by these commands.
+# ---------------------------------------------------------------------------------------------------
+def cmd_telemetry(args):
+    vt = _tel()
+    act = getattr(args, "telemetry_action", None) or "status"
+
+    if act == "status":
+        st = vt.consent_state()
+        on = vt.enabled()
+        print("\nPerformance telemetry   %s" % ("ENABLED" if on else "DISABLED"))
+        print("Consent version         %s" % ((st or {}).get("consent_version") or "(never asked)"))
+        if st and st.get("decided_at"):
+            print("Consented at            %s"
+                  % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["decided_at"])))
+        else:
+            print("Consented at            —")
+        print("Installation id         %s   (pseudonymous, not anonymous)" % vt.installation_id())
+        print("Pending reports         %d  (%.1f KB / cap %d reports, %d MB)"
+              % (vt.queue_count(), vt.queue_bytes() / 1024.0,
+                 vt.SPOOL_MAX_ITEMS, vt.SPOOL_MAX_BYTES // (1024 * 1024)))
+        print("Endpoint                %s/events   (separate from the license API)" % vt.TELEMETRY_API)
+        print("\nCollected")
+        for name, detail in vt.COLLECTED:
+            print("  [v] %-15s %s" % (name, detail))
+        print("\nNever collected")
+        for item in vt.NEVER_COLLECTED:
+            print("  [x] %s" % item)
+        print("\n%s" % vt.retention_note())
+        print("Declining telemetry never disables anything on your plan.")
+        return 0
+
+    if act == "enable":
+        vt.set_consent(True)
+        print("[telemetry] performance data ENABLED (consent version %s)." % vt.CONSENT_VERSION)
+        print("[telemetry] see exactly what is sent:  veizik telemetry status")
+        return 0
+
+    if act == "disable":
+        vt.set_consent(False)
+        print("[telemetry] performance data DISABLED — nothing further will be transmitted.")
+        n = vt.queue_count()
+        if n:
+            ans = ""
+            if getattr(args, "purge", False):
+                ans = "y"
+            elif getattr(args, "keep", False):
+                ans = "n"
+            else:
+                try:
+                    ans = input("[telemetry] delete the %d report(s) still queued locally? [y/N] "
+                                % n).strip().lower()
+                except EOFError:
+                    ans = ""
+            if ans in ("y", "yes"):
+                print("[telemetry] deleted %d queued report(s)." % vt.clear_queue())
+            else:
+                print("[telemetry] %d report(s) kept locally and will NOT be sent. Remove them any "
+                      "time with `veizik telemetry delete`." % n)
+        return 0
+
+    if act == "show-last":
+        rep = vt.last_report()
+        if not rep:
+            print("[telemetry] no run report queued yet.")
+            return 0
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
+        return 0
+
+    if act == "queue":
+        items = vt._spool_read()
+        if not items:
+            print("[telemetry] queue is empty.")
+            return 0
+        print("[telemetry] %d pending report(s), %.1f KB:" % (len(items), vt.queue_bytes() / 1024.0))
+        for it in items:
+            r = it.get("result") or {}
+            wl = it.get("workload") or {}
+            print("  %-20s %-10s %sx%s %ssteps  %-8s wall=%ss peak=%sGB"
+                  % (it.get("event_id", "")[:20], wl.get("model_public_id", "-"),
+                     wl.get("width", "-"), wl.get("height", "-"), wl.get("steps", "-"),
+                     r.get("status", "-"), r.get("wall_s", "-"), r.get("peak_vram_gb", "-")))
+        return 0
+
+    if act == "send":
+        n, msg = vt.send(force=getattr(args, "force", False))
+        print("[telemetry] %s" % msg)
+        return 0
+
+    if act == "export":
+        out = getattr(args, "out", None) or "veizik_telemetry_export.json"
+        n = vt.export(out)
+        print("[telemetry] exported %d pending report(s) -> %s" % (n, os.path.abspath(out)))
+        print("[telemetry] this is byte-for-byte what would be uploaded.")
+        return 0
+
+    if act == "delete":
+        n, msg = vt.delete_request()
+        print("[telemetry] removed %d locally queued report(s)." % n)
+        print("[telemetry] %s" % msg)
+        return 0
+
+    print("[telemetry] unknown action: %s" % act)
+    return 2
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik plans — the billing unit is CONCURRENT RUN NODES, never machines-you-own.
+#   Registered devices are a convenience limit; what you buy is how many renders run at once.
+# ---------------------------------------------------------------------------------------------------
+_PLANS = [
+    {"id": "starter", "name": "Starter Preview", "price": "free, 7 days",
+     "registered": 1, "concurrent": 1,
+     "includes": ["doctor", "limited sample + capsule runs", "experimental universal path"],
+     "excludes": ["commercial use", "watermark removal", "stable profiles"],
+     "note": "the 7 days start at your FIRST SUCCESSFUL RENDER, not at activation — "
+             "install trouble never burns trial time"},
+    {"id": "creator", "name": "Founding Creator", "price": "$9 / month  ·  $79 / year",
+     "registered": 2, "concurrent": 1,
+     "includes": ["commercial output", "watermark removal", "stable profiles",
+                  "Creator Adapters + Capsules", "automatic updates",
+                  "free until general availability, then 12 months of Founder pricing"],
+     "excludes": ["advanced FP8/INT8", "Queue/batch", "API"],
+     "note": ""},
+    {"id": "pro", "name": "Founding Pro Runtime Pass", "price": "$249-299 first year",
+     "registered": 3, "concurrent": 2,
+     "includes": ["everything in Creator", "advanced FP8/INT8 quantization", "Queue / batch",
+                  "advanced GPU Oracle", "priority access to Recover / TimeMachine / API",
+                  "Pro Preview for 24 months", "private release channel"],
+     "excludes": ["organisation-wide deployment", "central license server"],
+     "note": ""},
+    {"id": "studio", "name": "Studio Node", "price": "contact us",
+     "registered": "per contract", "concurrent": "per contract",
+     "includes": ["seats + concurrent nodes", "dedicated Adapters", "internal distribution",
+                  "central license server", "logs / audit / API"],
+     "excludes": [],
+     "note": "organisation agreement"},
+]
+
+
+def cmd_plans(args):
+    _banner()
+    print("\nveizik plans — you license CONCURRENT RUN NODES (how many renders execute at once).")
+    print("Registered devices are just a convenience cap; moving your work between your own")
+    print("machines is expected and free.\n")
+    hdr = ("plan", "price", "registered devices", "concurrent nodes")
+    rows = [(p["name"], p["price"], str(p["registered"]), str(p["concurrent"])) for p in _PLANS]
+    widths = [max(len(str(r[i])) for r in ([hdr] + rows)) for i in range(len(hdr))]
+    def fmt(r):
+        return "  " + "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r))
+    print(fmt(hdr))
+    print("  " + "  ".join("-" * w for w in widths))
+    for r in rows:
+        print(fmt(r))
+
+    for p in _PLANS:
+        print("\n%s — %s" % (p["name"], p["price"]))
+        print("  registered devices %s · concurrent nodes %s" % (p["registered"], p["concurrent"]))
+        for inc in p["includes"]:
+            print("    +  %s" % inc)
+        for exc in p["excludes"]:
+            print("    -  %s" % exc)
+        if p["note"]:
+            print("    note: %s" % p["note"])
+
+    try:
+        ve = _ent()
+        print("\n[current] %s" % ve.status_line(ve.resolve()))
+    except Exception:
+        pass
+    print("\nSeat terms today: 1 seat, 2 registered devices, 1 concurrent node, 3 device changes")
+    print("per year. Payment runs through Polar (merchant of record).")
+    print("Feature status:  veizik feature <name>      Pricing page:  https://veizik.com/#pricing")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik feature <name> — honest lifecycle status. Nothing here may claim to be Shipped when the
+#   public download does not run it. Stages: Research | Development | Private Preview |
+#   Public Preview | Shipped.
+# ---------------------------------------------------------------------------------------------------
+_STAGES = ("Research", "Development", "Private Preview", "Public Preview", "Shipped")
+
+# name -> (stage, plans-that-include-it, one-line description, honest caveat)
+_FEATURES = {
+    "doctor": ("Shipped", ["starter", "creator", "pro", "studio"],
+               "hardware probe + per-family support tier table",
+               "confirmed working in the public download"),
+    "license": ("Shipped", ["starter", "creator", "pro", "studio"],
+                "activate / status / logout, free entitlement",
+                "confirmed working in the public download"),
+    "telemetry": ("Shipped", ["starter", "creator", "pro", "studio"],
+                  "opt-in performance + compatibility reporting",
+                  "consent is separate from the license data class; declining locks nothing"),
+    "t2v": ("Public Preview", ["creator", "pro", "studio"],
+            "direct text-to-video through the universal path",
+            "experimental: Linux + NVIDIA only, and you supply your own torch/diffusers"),
+    "t2i": ("Public Preview", ["creator", "pro", "studio"],
+            "direct text-to-image through the universal path",
+            "experimental: Linux + NVIDIA only, and you supply your own torch/diffusers"),
+    "oracle": ("Public Preview", ["creator", "pro", "studio"],
+               "peak-VRAM / render-time prediction and admission control",
+               "basic prediction runs locally; the advanced planner is Pro and still in Development"),
+    "quantization": ("Private Preview", ["pro", "studio"],
+                     "advanced FP8 / INT8 native quantization",
+                     "the INT8 engine is measured internally only; it is NOT in the public binary"),
+    "timemachine": ("Private Preview", ["pro", "studio"],
+                    "checkpoint-native resume, branch and A/B fanout",
+                    "no public TimeMachine build has been released yet"),
+    "comfyui": ("Development", ["creator", "pro", "studio"],
+                "ComfyUI drop-in: `veizik run` and `veizik serve`",
+                "not shipped in the public download"),
+    "recover": ("Development", ["pro", "studio"],
+                "resume a failed or OOM-interrupted render from its last checkpoint",
+                "not shipped; Pro gets priority access when it lands"),
+    "queue": ("Development", ["pro", "studio"],
+              "persistent job queue across your concurrent nodes",
+              "not shipped; Pro gets priority access when it lands"),
+    "batch": ("Development", ["pro", "studio"],
+              "multi-job batch submission with shared model residency",
+              "not shipped; Pro gets priority access when it lands"),
+    "adapter": ("Development", ["creator", "pro", "studio"],
+                "private Model Adapters (a licensed model gains a tuned execution path)",
+                "the public Adapter interface is defined; the private packs are not released"),
+    "capsule": ("Development", ["creator", "pro", "studio"],
+                "Capsules: a reproducible, signed run configuration",
+                "not shipped in the public download"),
+    "api": ("Research", ["pro", "studio"],
+            "local HTTP API bridge for programmatic submission",
+            "design stage; no implementation is published"),
+}
+
+# Which plan a feature first becomes available on (display order matches _PLANS).
+_PLAN_NAME = {p["id"]: p["name"] for p in _PLANS}
+
+
+def _measurement_note():
+    return ("Render-time figures are measurement in progress. The one measured number we publish "
+            "is LTX-13B peak VRAM 9.55 GB (internal) plus block-level rel_L2 accuracy.")
+
+
+def cmd_feature(args):
+    vt_name = (args.name or "").strip().lower()
+    if not vt_name or vt_name in ("list", "all"):
+        print("\nFeature status — stages: %s\n" % " < ".join(_STAGES))
+        hdr = ("feature", "stage", "available on")
+        rows = [(k, v[0], ", ".join(_PLAN_NAME.get(p, p) for p in v[1]))
+                for k, v in sorted(_FEATURES.items(), key=lambda kv: (_STAGES.index(kv[1][0]), kv[0]))]
+        widths = [max(len(str(r[i])) for r in ([hdr] + rows)) for i in range(len(hdr))]
+        def fmt(r):
+            return "  " + "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r))
+        print(fmt(hdr))
+        print("  " + "  ".join("-" * w for w in widths))
+        for r in rows:
+            print(fmt(r))
+        print("\n%s" % _measurement_note())
+        print("Detail:  veizik feature <name>")
+        return 0
+
+    hit = _FEATURES.get(vt_name)
+    if not hit:
+        print("[feature] unknown feature %r. Known: %s" % (vt_name, ", ".join(sorted(_FEATURES))))
+        return 2
+    stage, plans, desc, caveat = hit
+    print("\n%s" % vt_name)
+    print("  %s" % desc)
+    print("  Stage           %s   (%s)" % (stage, " < ".join(_STAGES)))
+    print("  Available on    %s" % ", ".join(_PLAN_NAME.get(p, p) for p in plans))
+    print("  Reality check   %s" % caveat)
+
+    # is it in the CURRENT plan?
+    try:
+        ve = _ent()
+        ent = ve.resolve()
+        cur = ent.tier
+        cur_ids = {"free": "starter", "personal": "starter", "creator": "creator",
+                   "pro": "pro", "studio": "studio"}.get(cur, "starter")
+        included = cur_ids in plans
+        print("  Your plan       %s -> %s" % (ent.label(), "INCLUDED" if included else "NOT INCLUDED"))
+        if not included:
+            need = plans[0] if plans else "pro"
+            print("  Upgrade         %s covers it — https://veizik.com/#pricing"
+                  % _PLAN_NAME.get(need, need))
+    except Exception:
+        print("  Your plan       (no license session; run `veizik status`)")
+    if stage != "Shipped":
+        print("  NOTE            this is %s — it does not run in the public download today."
+              % stage)
+    print("\n%s" % _measurement_note())
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
+#   veizik upgrade <creator|pro> — print the URL. We never open a browser for you.
+# ---------------------------------------------------------------------------------------------------
+def cmd_upgrade(args):
+    target = (args.plan or "").strip().lower()
+    plan = next((p for p in _PLANS if p["id"] == target), None)
+    if plan is None:
+        print("[upgrade] unknown plan %r — choose: creator | pro" % target)
+        return 2
+    print("\n%s — %s" % (plan["name"], plan["price"]))
+    print("  registered devices %s · concurrent nodes %s" % (plan["registered"], plan["concurrent"]))
+    for inc in plan["includes"]:
+        print("    +  %s" % inc)
+    print("\nOpen this page in your browser:")
+    print("    https://veizik.com/#pricing")
+    print("\nThen activate on this machine:")
+    print("    veizik activate <YOUR_KEY>")
+    print("\n(Payment is handled by Polar as merchant of record. veizik never opens a browser for")
+    print("you and never takes card details in the terminal.)")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
 #   argparse
 # ---------------------------------------------------------------------------------------------------
 def build_parser():
@@ -1278,6 +1663,42 @@ def build_parser():
     p_status.set_defaults(func=cmd_status)
     p_logout = sub.add_parser("logout", help="remove the stored license session (revert to Free)")
     p_logout.set_defaults(func=cmd_logout)
+    # `activate` is the word on the receipt; identical behaviour to `login`.
+    p_act = sub.add_parser("activate", help="alias of `login`: activate a veizik key on this machine")
+    p_act.add_argument("api_key", help="your veizik API key (vzk_live_...) from veizik.com")
+    p_act.set_defaults(func=cmd_activate)
+
+    # plans / feature status / upgrade (commercial surface)
+    p_plans = sub.add_parser("plans", help="plans and what each includes (billed by concurrent run nodes)")
+    p_plans.set_defaults(func=cmd_plans)
+
+    p_feat = sub.add_parser("feature", help="honest status of a feature "
+                            "(Research|Development|Private Preview|Public Preview|Shipped)")
+    p_feat.add_argument("name", nargs="?", default="list",
+                        help="timemachine|recover|queue|batch|api|comfyui|... ('list' for all)")
+    p_feat.set_defaults(func=cmd_feature)
+
+    p_up = sub.add_parser("upgrade", help="how to move to a paid plan (prints the URL, opens nothing)")
+    p_up.add_argument("plan", choices=["creator", "pro"], help="target plan")
+    p_up.set_defaults(func=cmd_upgrade)
+
+    # telemetry — the OPTIONAL performance/compatibility channel only
+    p_tel = sub.add_parser("telemetry", help="optional performance data: status/enable/disable/"
+                           "show-last/queue/send/export/delete")
+    tsub = p_tel.add_subparsers(dest="telemetry_action")
+    tsub.add_parser("status", help="consent version/time, pending count, exactly what is and is not collected")
+    tsub.add_parser("enable", help="turn optional performance reporting ON")
+    t_dis = tsub.add_parser("disable", help="stop all future transmission (asks about the local queue)")
+    t_dis.add_argument("--purge", action="store_true", help="also delete the local queue, no prompt")
+    t_dis.add_argument("--keep", action="store_true", help="keep the local queue, no prompt")
+    tsub.add_parser("show-last", help="print the most recent run report verbatim")
+    tsub.add_parser("queue", help="list the reports waiting to be sent")
+    t_send = tsub.add_parser("send", help="upload the queued batch now")
+    t_send.add_argument("--force", action="store_true", help="ignore the 24h batching window")
+    t_exp = tsub.add_parser("export", help="write the exact bytes that would be uploaded to a file")
+    t_exp.add_argument("--out", default="veizik_telemetry_export.json")
+    tsub.add_parser("delete", help="erase local reports and request server-side erasure")
+    p_tel.set_defaults(func=cmd_telemetry, telemetry_action=None)
 
     p_run = sub.add_parser("run", help="DROP-IN for `comfy run`: render a ComfyUI workflow JSON")
     p_run.add_argument("workflow", help="path to a ComfyUI workflow .json (API or graph format)")
