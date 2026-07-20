@@ -123,7 +123,7 @@ Full details at [veizik.com/#pricing](https://veizik.com/#pricing).
 | Plan | Price |
 | --- | --- |
 | Free Preview | $0 — install, hardware check, free entitlement, experimental render |
-| Founding Creator | **$9 / month when checkout is live** — first 100 paid subscribers, price locked 12 months. Reservation (free key) is open now; no payment collected yet |
+| Founding Creator | **$9 / month when checkout is live** (or $79/year, ~27% off) — first 100 paid subscribers, price locked 12 months. Reservation (free key) is open now; no payment collected yet |
 | Pro / Studio | not currently available — opens after Preview validation |
 
 ### Founding 100
@@ -133,6 +133,11 @@ The first 100 paid subscriptions get:
 - Founder price locked for 12 months
 - Founder feedback access
 - Priority compatibility support
+
+**License unit — a personal seat, not a PC.** One user may register up to **2 computers**
+and run on **1 at a time** (concurrency is what is metered, never install count). Device
+change is self-service up to 3×/year; registration binds to a machine fingerprint, not the
+GPU alone, so a GPU swap does not break the license.
 
 The Founding-100 counter is computed server-side from **real paid subscriptions only** (not
 checkout starts).
