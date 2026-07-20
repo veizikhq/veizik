@@ -79,6 +79,11 @@ def _tel():
     return vt
 
 
+def _packs():
+    import veizik_packs as vp
+    return vp
+
+
 def _gate_paid(feature, label):
     """Gate a paid-only feature (TimeMachine branch/fanout). Returns None if allowed, else prints an
     upgrade notice and returns an exit code. Free/entry tiers don't get these."""
@@ -179,6 +184,55 @@ def cmd_status(args):
 
 def cmd_logout(args):
     print("[logout] session removed" if _ent().logout() else "[logout] no active session")
+    return 0
+
+
+def cmd_verify(args):
+    """Prove you control the license email, so a payment binds to THIS key.
+
+    Optional but recommended: without it the server falls back to a heuristic when deciding which
+    key a payment upgrades. Verifying makes that binding provable, and it is what stops someone who
+    merely knows your email from riding your subscription.
+    """
+    import json as _json
+    import urllib.request as _u
+    ve = _ent()
+    # the session accessor is module-private (_load_session); fall back gracefully so `verify`
+    # still works when nobody is logged in (email must then be supplied with --email).
+    _ls = getattr(ve, "load_session", None) or getattr(ve, "_load_session", None)
+    sess = None
+    if _ls:
+        try:
+            sess = _ls()
+        except Exception:
+            sess = None
+    # the license email lives inside the signed entitlement payload, not at the session top level
+    payload = (sess or {}).get("payload") or {}
+    email = getattr(args, "email", None) or (sess or {}).get("email") or payload.get("email")
+    api_key = (sess or {}).get("api_key")
+    if not email:
+        print("[verify] no license email found — run `veizik login <KEY>` first, or pass --email")
+        return 2
+    body = {"email": email}
+    if api_key:
+        body["api_key"] = api_key
+    req = _u.Request(ve.API_BASE + "/api/auth/magic-link", data=_json.dumps(body).encode(),
+                     headers={"Content-Type": "application/json",
+                              "User-Agent": "veizik-cli/1.0 (+https://veizik.com)"}, method="POST")
+    try:
+        with _u.urlopen(req, timeout=20) as r:
+            out = _json.loads(r.read())
+    except Exception as e:
+        print("[verify] could not reach veizik.com: %s" % e)
+        print("[verify] this is optional — your license keeps working.")
+        return 1
+    if not out.get("ok"):
+        print("[verify] %s" % out.get("error", "request rejected"))
+        return 1
+    print("[verify] verification link sent to %s" % email)
+    print("[verify] open it within 30 minutes; it can be used once.")
+    if not out.get("delivered"):
+        print("[verify] (queued for delivery — it may take a minute to arrive)")
     return 0
 
 
@@ -1530,6 +1584,10 @@ _FEATURES = {
     "oracle": ("Public Preview", ["creator", "pro", "studio"],
                "peak-VRAM / render-time prediction and admission control",
                "basic prediction runs locally; the advanced planner is Pro and still in Development"),
+    "pack": ("Shipped", ["starter", "creator", "pro", "studio"],
+             "signed runtime packs: list/install/verify/status, Ed25519 verified",
+             "the loader and verifier are in the public download and work today; the only pack "
+             "published so far is Creator profiles/capsules — no native runtime pack exists yet"),
     "quantization": ("Private Preview", ["pro", "studio"],
                      "advanced FP8 / INT8 native quantization",
                      "the INT8 engine is measured internally only; it is NOT in the public binary"),
@@ -1642,6 +1700,199 @@ def cmd_upgrade(args):
 
 
 # ---------------------------------------------------------------------------------------------------
+#   veizik pack  (list | install | verify | status) — the tier-unlock mechanism.
+#
+#   There is ONE public binary. It contains the CLI parser, updater, doctor, license client,
+#   telemetry client, pack loader, signature verifier and the public Adapter interface — and nothing
+#   that a paid tier pays for. What a tier buys is a signed entitlement plus the right to fetch
+#   private runtime packs. No per-tier executables exist and none are planned.
+#
+#   The sequence below is fixed and has no bypass flag:
+#       license token -> feature manifest -> download -> SIGNATURE VERIFY -> unlock
+#   Ed25519, with the private key offline and only the public key embedded in the client, so a
+#   compromised veizik.com can serve any bytes it likes and every one of them is refused. All the
+#   verification logic lives in veizik_packs.py (lazily imported — `veizik doctor` must keep working
+#   on a stdlib-only host).
+#
+#   HONESTY: the native runtime is not distributable yet, so the only pack that exists today is the
+#   Creator profile pack, and it is configuration — stable execution profiles, capsule definitions
+#   and the selection rules. No .so, no .cu, no kernel. Say so on screen, every time.
+# ---------------------------------------------------------------------------------------------------
+def _pack_tier():
+    """(tier_id, human_label) for the current seat. Free when there is no session."""
+    try:
+        ent = _ent().resolve(quiet=True)
+        return ent.tier, ent.label()
+    except Exception:
+        return "free", "Free"
+
+
+def _pack_reality_note():
+    return ("Only configuration packs exist today (profiles, capsules, selection rules).\n"
+            "  The LimML native runtime, advanced kernels and quantization engine are NOT yet\n"
+            "  distributable and are in no pack. Render-time figures: measurement in progress.")
+
+
+def cmd_pack(args):
+    vp = _packs()
+    act = getattr(args, "pack_action", None) or "list"
+    tier, label = _pack_tier()
+
+    # --- pack list ------------------------------------------------------------------------------
+    if act == "list":
+        _banner()
+        print("\n[pack] licence: %s   manifest: %s" % (label, vp.manifest_url()))
+        if not vp.crypto_available():
+            print("[pack] WARNING: `cryptography` is not installed, so no signature can be checked.")
+            print("       Installation will be REFUSED until it is:  python3 -m pip install cryptography")
+        try:
+            rows = vp.list_packs(tier)
+        except vp.PackError as e:
+            print("\n[pack] %s" % e)
+            return 2
+        if not rows:
+            print("\n[pack] the manifest lists no packs.")
+            return 0
+        hdr = ("pack", "version", "tier", "signature", "your access", "installed")
+        table = []
+        for r in rows:
+            sig = "verified" if r["signature_ok"] else "REFUSED"
+            if not r["signature_ok"]:
+                access = "-"
+            elif r["eligible"]:
+                access = "available"
+            else:
+                access = "needs %s" % vp.TIER_LABEL.get(r["tier"], r["tier"])
+            table.append((r["pack_id"], r["version"], r["tier"], sig, access,
+                          r["installed_version"] or "-"))
+        widths = [max(len(str(x[i])) for x in ([hdr] + table)) for i in range(len(hdr))]
+        def fmt(row):
+            return "  " + "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row))
+        print("")
+        print(fmt(hdr))
+        print("  " + "  ".join("-" * w for w in widths))
+        for row in table:
+            print(fmt(row))
+        for r in rows:
+            print("\n  %s %s — %s" % (r["pack_id"], r["version"], r["summary"] or "(no summary)"))
+            if r["contains"]:
+                print("    contains  %s" % ", ".join(r["contains"]))
+            if r["unlocks"]:
+                print("    unlocks   %s" % ", ".join(r["unlocks"]))
+            if not r["signature_ok"]:
+                print("    REFUSED   %s" % r["reason"])
+        print("\n[pack] %s" % _pack_reality_note())
+        print("[pack] install with:  veizik pack install <pack_id>")
+        return 0
+
+    # --- pack install ---------------------------------------------------------------------------
+    if act == "install":
+        _banner()
+        print("\n[pack] licence: %s" % label)
+        try:
+            results = vp.install(getattr(args, "pack_id", None), tier,
+                                 dry_run=getattr(args, "dry_run", False))
+        except vp.PackError as e:
+            print("\n[pack] %s" % e)
+            return 3
+        refused = 0
+        for res in results:
+            pid = res["pack_id"]
+            action = res["action"]
+            if action == "installed":
+                print("\n[pack] installed %s %s (tier %s, %d file(s))"
+                      % (pid, res["version"], res["tier"], res["files"]))
+                print("       -> %s" % res["path"])
+            elif action == "already-current":
+                print("\n[pack] %s %s is already installed and current." % (pid, res["version"]))
+            elif action == "would-install":
+                print("\n[pack] --dry-run: would install %s %s (tier %s); signature already verified."
+                      % (pid, res["version"], res["tier"]))
+            else:
+                refused += 1
+                print("\n[pack] refused %s:\n  %s" % (pid, res["reason"]))
+        if not results:
+            print("\n[pack] nothing to install.")
+        unlocked = vp.unlocked_features()
+        if unlocked:
+            print("\n[pack] features now unlocked: %s"
+                  % ", ".join("%s (%s)" % (f, p) for f, p in sorted(unlocked.items())))
+        print("\n[pack] %s" % _pack_reality_note())
+        # A refusal is a real, actionable answer (wrong tier, bad signature, downgrade attempt),
+        # not a crash — distinct exit code so scripts can tell it from a transport failure.
+        return 3 if refused else 0
+
+    # --- pack verify ----------------------------------------------------------------------------
+    if act == "verify":
+        _banner()
+        rows = vp.verify_installed()
+        if not rows:
+            print("\n[pack] no packs installed — nothing to verify.")
+            return 0
+        print("\n[pack] re-verifying %d installed pack(s): file contents + detached signature\n"
+              % len(rows))
+        bad = 0
+        for r in rows:
+            if r["ok"]:
+                print("  OK       %-22s %-8s tier=%-8s %d file(s), signature re-checked"
+                      % (r["pack_id"], r["version"], r["tier"], r.get("files", 0)))
+            else:
+                bad += 1
+                print("  FAILED   %-22s %-8s %s" % (r["pack_id"], r["version"] or "?", r["reason"]))
+        if bad:
+            print("\n[pack] %d pack(s) FAILED verification. They are on disk but must not be trusted;"
+                  % bad)
+            print("       reinstall with:  veizik pack install <pack_id>")
+            return 4
+        print("\n[pack] every installed pack matches what veizik signed.")
+        return 0
+
+    # --- pack status ----------------------------------------------------------------------------
+    if act == "status":
+        _banner()
+        inst = vp.installed()
+        print("\n[pack] licence          %s" % label)
+        print("[pack] manifest         %s" % vp.manifest_url())
+        print("[pack] signature check  %s"
+              % ("Ed25519, embedded public key" if vp.crypto_available()
+                 else "UNAVAILABLE (`cryptography` missing) — installs are refused"))
+        print("[pack] install root     %s" % vp.PACKS_DIR)
+        if not inst:
+            print("\n[pack] no packs installed. This seat runs the public path only:")
+            print("       the limml_universal autotuner derives a plan from your hardware")
+            print("       on every render, with no stable profile applied.")
+            print("\n[pack] see what you can install:  veizik pack list")
+            print("\n[pack] %s" % _pack_reality_note())
+            return 0
+        print("\n[pack] installed:")
+        for pid, rec in sorted(inst.items()):
+            print("\n  %s %s   (tier %s, installed %s)"
+                  % (pid, rec.get("version"), rec.get("tier"), rec.get("installed_at")))
+            if rec.get("summary"):
+                print("    %s" % rec["summary"])
+            print("    path      %s" % rec.get("path"))
+            print("    files     %d" % len(rec.get("files") or {}))
+            print("    sha256    %s" % (rec.get("sha256") or "")[:32])
+        unlocked = vp.unlocked_features()
+        print("\n[pack] features unlocked by installed packs:")
+        if unlocked:
+            for feat, pid in sorted(unlocked.items()):
+                print("    %-14s <- %s" % (feat, pid))
+        else:
+            print("    (none)")
+        prof = vp.load_profiles()
+        if prof:
+            print("\n[pack] active profile source: %s (%d stable profile(s))"
+                  % (prof.get("_pack_id"), len(prof.get("profiles") or {})))
+        print("\n[pack] verify these against the signature at any time:  veizik pack verify")
+        print("\n[pack] %s" % _pack_reality_note())
+        return 0
+
+    print("[pack] unknown action: %s" % act)
+    return 2
+
+
+# ---------------------------------------------------------------------------------------------------
 #   argparse
 # ---------------------------------------------------------------------------------------------------
 def build_parser():
@@ -1663,6 +1914,10 @@ def build_parser():
     p_status.set_defaults(func=cmd_status)
     p_logout = sub.add_parser("logout", help="remove the stored license session (revert to Free)")
     p_logout.set_defaults(func=cmd_logout)
+
+    p_verify = sub.add_parser("verify", help="prove you own the license email (binds payments to this key)")
+    p_verify.add_argument("--email", help="override the email (defaults to your logged-in license email)")
+    p_verify.set_defaults(func=cmd_verify)
     # `activate` is the word on the receipt; identical behaviour to `login`.
     p_act = sub.add_parser("activate", help="alias of `login`: activate a veizik key on this machine")
     p_act.add_argument("api_key", help="your veizik API key (vzk_live_...) from veizik.com")
@@ -1681,6 +1936,22 @@ def build_parser():
     p_up = sub.add_parser("upgrade", help="how to move to a paid plan (prints the URL, opens nothing)")
     p_up.add_argument("plan", choices=["creator", "pro"], help="target plan")
     p_up.set_defaults(func=cmd_upgrade)
+
+    # pack — signed runtime packs: one public binary + entitlement + per-tier pack.
+    # Every install path runs through an Ed25519 signature check against the public key embedded
+    # in this client; there is deliberately no --skip-verify / --force / --insecure flag to add.
+    p_pack = sub.add_parser("pack", help="signed runtime packs: list/install/verify/status "
+                            "(what your tier unlocks, and proof it is what we signed)")
+    psub = p_pack.add_subparsers(dest="pack_action")
+    psub.add_parser("list", help="packs in the manifest, their signature state, and your access")
+    p_pi = psub.add_parser("install", help="install the packs your tier entitles you to (verified)")
+    p_pi.add_argument("pack_id", nargs="?", default=None,
+                      help="pack to install; omit to install every pack your tier allows")
+    p_pi.add_argument("--dry-run", action="store_true", dest="dry_run",
+                      help="verify signature + entitlement, then stop before downloading")
+    psub.add_parser("verify", help="re-verify every installed pack: file contents + signature")
+    psub.add_parser("status", help="installed packs and the features they unlock")
+    p_pack.set_defaults(func=cmd_pack, pack_action=None)
 
     # telemetry — the OPTIONAL performance/compatibility channel only
     p_tel = sub.add_parser("telemetry", help="optional performance data: status/enable/disable/"
