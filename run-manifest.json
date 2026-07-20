@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "capsule_id": "ltx-13b-t2v-preview",
+  "veizik_version": "0.1.0",
+  "engine_version": null,
+  "status": "measurement_in_progress",
+  "run_id": null,
+  "timestamp_utc": null,
+  "model_id": "LTX-Video-13B",
+  "model_sha256": null,
+  "hardware": {
+    "vendor": "nvidia",
+    "device_name": "RTX 3090",
+    "device_class": "24 GB VRAM class",
+    "vram_gb": 24,
+    "ram_gb": null,
+    "os": "linux",
+    "arch": "x86_64",
+    "os_version": null,
+    "driver": null,
+    "runtime": "cuda",
+    "runtime_version": null,
+    "support_tier": "internally_verified"
+  },
+  "workload": {
+    "width": null,
+    "height": null,
+    "frames": null,
+    "steps": null,
+    "seed": null,
+    "precision": null,
+    "quality_mode": null
+  },
+  "result": {
+    "status": "measurement_in_progress",
+    "wall_seconds": null,
+    "cold_start_ms": null,
+    "model_load_ms": null,
+    "render_ms": null,
+    "decode_ms": null,
+    "postprocess_ms": null,
+    "total_ms": null,
+    "peak_vram_gb": 9.55,
+    "peak_vram_label": "internal",
+    "peak_ram_gb": null,
+    "output_sha256": null,
+    "error_code": null
+  },
+  "numerical_equivalence": {
+    "scope": "6 model-family engine paths numerically checked at block/engine level",
+    "e2e_generation_verified": false,
+    "rel_l2_range": "~1e-6..1e-7"
+  },
+  "external_reproductions": 0,
+  "privacy": {
+    "input_uploaded": false,
+    "output_uploaded": false,
+    "prompt_uploaded": false,
+    "user_opt_in": false
+  },
+  "notes": "Template awaiting measurement. Render TIME and throughput fields are intentionally null (measurement in progress). The only populated measurement is peak_vram_gb, which applies to LTX-13B on RTX 3090 (label: internal) and is a VRAM figure, not a render time. external_reproductions is 0 (Public Preview)."
+}

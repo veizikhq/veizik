@@ -1,0 +1,141 @@
+name: Failed render / run report
+description: A veizik command errored or a render did not complete. Help us reproduce it.
+title: "[run] <short description of the failure>"
+labels: ["run-failure", "preview"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping harden the **Public Preview**. Veizik has had **zero external reproductions** so far — your report is real signal.
+
+        **Before you paste anything, please strip personal content.** We do **not** need your prompt text, and we do **not** want any generated image or video. Only error codes, the `veizik doctor` table, and log lines. Redact file paths or names you would rather not share.
+
+        Public build scope, so you file against the right thing:
+        - **Live in the download:** `veizik doctor`, `veizik login` / `status` / `logout`, free entitlement.
+        - **Experimental (Linux + NVIDIA, you supply the torch/diffusers env):** `veizik t2v`, `veizik t2i`.
+        - **Not in the public download yet:** ComfyUI `run` / `serve`, TimeMachine build, native CUDA DiT engine binary, collapse detector. If your issue is one of these, it is expected — they are upcoming/planned, not shipped.
+
+  - type: checkboxes
+    id: prereqs
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest published Public Preview build.
+          required: true
+        - label: I removed my prompt text and did not attach any generated media or personal content.
+          required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Veizik version
+      description: Output of `veizik --version` (or the release tag you installed).
+      placeholder: "e.g. v0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: run-id
+    attributes:
+      label: Run ID
+      description: The run/session ID printed by the command, if any. Leave blank if none was shown.
+      placeholder: "e.g. run_a1b2c3"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command / feature failed?
+      options:
+        - "veizik doctor"
+        - "veizik login / status / logout"
+        - "veizik t2v (experimental)"
+        - "veizik t2i (experimental)"
+        - "install.sh / setup"
+        - "Other (describe below)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware-class
+    attributes:
+      label: Hardware / support class
+      description: Pick the row that matches your machine. See the support tiers in the README.
+      options:
+        - "Internally verified — Linux x86_64 + NVIDIA CUDA + 24 GB VRAM class"
+        - "Experimental — Windows WSL2 + NVIDIA"
+        - "Planned — other NVIDIA memory class"
+        - "Planned — Apple Silicon"
+        - "Planned — mobile / other"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Distro/version, or Windows + WSL2 distro.
+      placeholder: "e.g. Ubuntu 22.04 native, or Windows 11 + WSL2 Ubuntu 22.04"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu-vram
+    attributes:
+      label: GPU + VRAM
+      description: GPU model and total VRAM. From `nvidia-smi` if unsure.
+      placeholder: "e.g. RTX 3090, 24 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model / model family
+      description: Which model were you rendering with (experimental t2v/t2i only)? Leave blank if not applicable.
+      placeholder: "e.g. LTX-Video, CogVideoX, FLUX.1-dev"
+    validations:
+      required: false
+
+  - type: input
+    id: error-code
+    attributes:
+      label: Error code / one-line message
+      description: The error code or the single most relevant error line. No prompt text.
+      placeholder: "e.g. CUDA out of memory / VZK_ENV_MISSING / exit 1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: veizik doctor output
+      description: Paste the full `veizik doctor` output (hardware scan + support-tier table). This runs even without a GPU.
+      render: text
+      placeholder: |
+        $ veizik doctor
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Last ~50 log lines
+      description: The last 50 lines of output/log around the failure. Redact anything sensitive. Do NOT paste prompts or generated media.
+      render: text
+      placeholder: |
+        (paste last ~50 lines of the failing run here)
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: What you were trying to do, whether it is reproducible, and any steps you have already tried.
+    validations:
+      required: false

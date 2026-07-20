@@ -1,0 +1,95 @@
+title: "[hardware] <GPU> · <VRAM> · <OS>"
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share what Veizik's **Public Preview** did on your hardware — good or bad. This is a community wall of real environments, not a bug tracker (open a **Failed run** or **Compatibility report** issue for anything that needs a fix).
+
+        Veizik has **zero external reproductions** so far, so every honest data point helps map what actually runs where.
+
+        **What is live in the download today:** `veizik doctor` (hardware scan + per-model-family support tier), `veizik login` / `status` / `logout`, and free entitlement. The universal `veizik t2v` / `t2i` render path is **experimental** (Linux + NVIDIA, you bring your own torch/diffusers env). ComfyUI integration, TimeMachine, the native CUDA DiT engine, and the collapse detector are **not in the public build yet**.
+
+        **Please do not post prompts, generated images, or generated video.** Just the environment and what happened.
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: "e.g. NVIDIA RTX 3090"
+    validations:
+      required: true
+
+  - type: input
+    id: vram
+    attributes:
+      label: VRAM
+      placeholder: "e.g. 24 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "e.g. Ubuntu 22.04 native, or Windows 11 + WSL2"
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: System RAM
+      placeholder: "e.g. 32 GB"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: support-class
+    attributes:
+      label: Which support class does your setup fall under?
+      options:
+        - "Internally verified — Linux x86_64 + NVIDIA CUDA + 24 GB VRAM class"
+        - "Experimental — Windows WSL2 + NVIDIA"
+        - "Planned — other NVIDIA memory class"
+        - "Planned — Apple Silicon"
+        - "Planned — mobile / other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-tier
+    attributes:
+      label: veizik doctor result
+      description: Paste the support-tier table doctor printed for you (optional but very useful). No prompts or media.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: How far did you get?
+      options:
+        - "doctor ran and showed my tiers"
+        - "doctor + login both worked"
+        - "tried the experimental t2v render (Linux + NVIDIA)"
+        - "install or doctor failed"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: In your own words — what ran, what the tiers said, whether it matched your expectation, and anything surprising.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes for others with similar hardware
+      description: Optional tips — driver/CUDA version, install gotchas, WSL2 quirks. No prompts or media.
+    validations:
+      required: false

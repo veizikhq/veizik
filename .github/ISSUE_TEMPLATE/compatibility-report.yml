@@ -1,0 +1,114 @@
+name: Compatibility report
+description: Tell us whether the Public Preview install, hardware check, and login worked on your machine.
+title: "[compat] <GPU> · <OS>"
+labels: ["compatibility", "preview"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Public Preview has **zero external reproductions** so far, so a plain "it worked" or "it did not" is genuinely useful.
+
+        We are checking three things that are actually **live in the download**: install, `veizik doctor` (hardware scan + support-tier table), and `veizik login`. The universal `veizik t2v` render path is **experimental** and only on Linux + NVIDIA with a torch/diffusers env you supply — report it if you got that far, but a failure there is expected on unsupported setups.
+
+        **Privacy:** do not paste prompts or attach any generated image or video. We only need environment details and the `veizik doctor` table.
+
+  - type: checkboxes
+    id: prereqs
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing compatibility reports for my GPU/OS first.
+          required: true
+        - label: I did not attach prompts or generated media.
+          required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "e.g. Ubuntu 22.04 native, or Windows 11 + WSL2 Ubuntu 22.04"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: GPU model (from `nvidia-smi` if unsure).
+      placeholder: "e.g. NVIDIA RTX 4070"
+    validations:
+      required: true
+
+  - type: input
+    id: vram
+    attributes:
+      label: VRAM
+      description: Total GPU memory.
+      placeholder: "e.g. 12 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: System RAM
+      placeholder: "e.g. 32 GB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-tier
+    attributes:
+      label: veizik doctor — support-tier result
+      description: Paste the support-tier table `veizik doctor` printed for each model family (or the full doctor output).
+      render: text
+      placeholder: |
+        $ veizik doctor
+        ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: doctor-worked
+    attributes:
+      label: Did `veizik doctor` run and print a tier table?
+      options:
+        - "Yes — ran cleanly"
+        - "Ran, but printed an error or looked wrong"
+        - "No — it crashed / failed to run"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: login-worked
+    attributes:
+      label: Did `veizik login` / `status` work?
+      options:
+        - "Yes — free entitlement activated, status shows tier"
+        - "Partly — logged in but status looked wrong"
+        - "No — login failed"
+        - "Did not try"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: t2v-worked
+    attributes:
+      label: Did the experimental `veizik t2v` render run? (Linux + NVIDIA only)
+      description: Optional. This path is experimental and requires your own torch/diffusers env.
+      options:
+        - "Did not try"
+        - "Yes — a clip rendered"
+        - "Started but errored partway"
+        - "Failed to start (environment/setup)"
+        - "N/A — not on Linux + NVIDIA"
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything unexpected — install friction, driver/CUDA versions, whether the tier matched your expectation. No prompts or media, please.
+    validations:
+      required: false

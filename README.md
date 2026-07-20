@@ -1,66 +1,162 @@
-# Veizik — Local AI Video Runtime
+# Veizik
 
-Run large AI video models on the GPU you already own. **Low-VRAM, memory-resident execution for RTX 3090 / 4090 (24 GB)-class GPUs** — Wan · HunyuanVideo · LTX · Step-Video · FLUX · CogVideoX. Local. No cloud rendering.
+**A hardware-aware local AI media runtime.** Veizik checks your GPU and picks a runnable
+profile so large AI video models run locally, without manual memory tuning. Rendering
+happens on hardware you own — no cloud render service, and your media and prompts stay on
+your machine. Powered by the LimML engine.
 
-*Veizik is a proprietary commercial runtime — **not open source**. This repo is the public distribution channel: CLI, hardware check, and license client.*
-
-> **Public Preview (v0.1.0)** — current verified and experimental environments are listed in [SUPPORTED.md](SUPPORTED.md). Numbers below are **internal benchmarks** on our own hardware; external reproduction is what this preview is for.
+This README describes only what the **public download actually does**. Anything not yet in
+the download is labeled as planned or experimental, on purpose.
 
 ---
 
-## Install (60 seconds)
+## Public Preview v0.1.0
+
+**Live** (confirmed working in the public download):
+- `doctor` — hardware scan + per-model-family support tier table (Python stdlib only; runs with no GPU)
+- `login` / `status` / `logout` — veizik.com server-signed entitlement client
+- free entitlement issuance
+
+**Experimental** (public, but constrained):
+- universal `t2v` / `t2i` — Linux + NVIDIA only; you bring your own torch/diffusers environment
+
+**Not yet public** (not in the download — do not read these as available today):
+- ComfyUI drop-in (`run` / `serve`) — ComfyUI integration, upcoming preview
+- TimeMachine preview build — planned for a Preview build
+- native CUDA DiT engine assets — planned platform release assets
+
+External reproduction so far: none. This is a Public Preview, and independent verification
+on your own hardware is exactly what it is for.
+
+---
+
+## Install
+
+Linux or Windows WSL2, with `git` and Python 3.10+:
 
 ```sh
 curl -fsSL https://veizik.com/install.sh | sh
 ```
 
-Requires `git` + Python 3.10+. Then:
+Nothing renders on install. The next step is to check your hardware.
+
+---
+
+## Usage
+
+### Check your hardware
 
 ```sh
-veizik doctor                 # hardware scan + per-model-family support tier
-veizik login <YOUR_API_KEY>   # free key: https://veizik.com  (shown once at signup)
-veizik status
+veizik doctor
 ```
 
-- **Detects your hardware** and shows what tier each model family runs at
-- **Free API key** activates the runtime (non-commercial, watermarked)
-- **Keeps input and output local** — the runtime only talks to veizik.com for license entitlement (key id, device id, tier — never your media or prompts)
+`veizik doctor` scans this machine and prints a support tier per model family, so you know
+what fits before you render. It uses the Python standard library only and runs even without
+a GPU present.
 
-## What works in v0.1.0 (Public Preview)
+### Activate a free entitlement
 
-| Command | Status |
-|---|---|
-| `veizik doctor` | ✅ works everywhere (hardware + support-tier table) |
-| `veizik login / status / logout` | ✅ live against veizik.com |
-| `veizik t2v / t2i` (universal engine) | 🧪 experimental — Linux + NVIDIA, needs your own `torch`/`diffusers` env |
-| `veizik run / serve` (ComfyUI drop-in) | 🔜 next release |
-| Native CUDA DiT engines, TimeMachine | 🔜 ship as platform release assets (not in-repo) |
+```sh
+veizik login <key>     # redeem a free key from veizik.com for a server-signed entitlement
+veizik status          # show the current tier and entitlement
+veizik logout          # clear the local entitlement
+```
 
-Known problems are tracked honestly in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+Get a free key at [veizik.com](https://veizik.com). Your media and prompts stay local; only
+license data is exchanged with the server.
 
-## Internal benchmarks (our hardware, fixed conditions)
+### Experimental render (Linux + NVIDIA)
 
-Measured on a single RTX 3090 24 GB, warm runs, fixed seed — *internal, not yet externally reproduced*:
+```sh
+# universal render path — you provide a torch/diffusers environment
+veizik t2v "a barista pouring latte art" --model ltx
+veizik t2i "a warm-lit product shot on a wooden table" --model flux
+```
 
-- **LTX-13B** 1280×704 · 49 frames · 40 steps ≈ **99.6 s** (9.55 GB peak — no OOM)
-- **CogVideoX** 720×480 · 49 frames · 50 steps ≈ **387.6 s**
+The universal `t2v` / `t2i` path is experimental. It targets Linux + NVIDIA and depends on a
+torch/diffusers environment you set up yourself.
 
-Full conditions and the run-manifest schema: [veizik.com/results.html](https://veizik.com/results.html). If you get different numbers on your hardware, **please open an issue — that data is exactly what we want.**
+---
+
+## What is measured
+
+Veizik separates claim types deliberately. Two things are checked internally today; render
+timings are not yet published.
+
+**Peak VRAM (internal):** LTX-13B peak VRAM **9.55 GB** on an RTX 3090 (internal). This is a
+VRAM figure, not a render time.
+
+**Block/engine-level numerical checks (internal):** 6 model-family engine paths are
+numerically checked at the block/engine level (rel_L2 ~1e-6..1e-7 vs the reference
+implementation): Step-Video 30B, HunyuanVideo, Wan 2.1, LTX-Video, CogVideoX, and FLUX.1-dev.
+This is a component-level numerical check — **not** an end-to-end generation benchmark.
+
+**Render time / throughput:** intentionally left blank. Benchmarks are being finalized — see
+[veizik.com](https://veizik.com). No render-time numbers are published in this README until
+they are repeated and externally reproducible.
+
+---
+
+## Support tiers
+
+Honest scope for the Public Preview. See [SUPPORTED.md](SUPPORTED.md) for the full matrix.
+
+| Tier | Environment |
+| --- | --- |
+| Internally verified | Linux x86_64 + NVIDIA CUDA + 24 GB VRAM class |
+| Experimental | Windows WSL2 + NVIDIA |
+| Planned | additional NVIDIA memory classes · Apple Silicon · mobile adapters |
+
+This is a Public Preview with no external reproductions yet. We do not claim universal GPU
+support, and we do not claim that any given model always runs or that a profile swap never
+fails — that is precisely what external testing is meant to establish.
+
+Known limitations and the honest issue ledger: [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+---
 
 ## Pricing
 
-Free key = install, verify, watermarked non-commercial renders. Paid tiers (Creator $24 / Pro $59, merchant-of-record checkout, tax handled): **[veizik.com/#pricing](https://veizik.com/#pricing)**.
+Pricing is a **local runtime license** — not cloud credits. You supply the GPU.
+Full details at [veizik.com/#pricing](https://veizik.com/#pricing).
 
-**Founding 100** — the first 100 paid subscriptions keep their price locked for 12 months. Live seat counter (server-computed, real paid subscriptions only) on [veizik.com](https://veizik.com).
+| Plan | Price |
+| --- | --- |
+| Free Preview | $0 — install, hardware check, free entitlement, experimental render |
+| Founding Creator | $9 / mo — first 100 paid subscribers |
+| Pro / Studio | opens after Preview validation |
 
-## Privacy
+### Founding 100
 
-Your images, videos, and prompts never leave your machine. The CLI contacts veizik.com only for license entitlement/session lease. Details: [veizik.com/privacy.html](https://veizik.com/privacy.html).
+The first 100 paid subscriptions get:
 
-## Support
+- Founder price locked for 12 months
+- Founder feedback access
+- Priority compatibility support
 
-- Bugs / compatibility reports: [GitHub Issues](https://github.com/veizikhq/veizik/issues)
-- Email: support@veizik.com
-- Terms: [veizik.com/terms.html](https://veizik.com/terms.html) · Refunds: [veizik.com/refund.html](https://veizik.com/refund.html)
+The Founding-100 counter is computed server-side from **real paid subscriptions only** (not
+checkout starts).
 
-© 2026 Veizik. Proprietary. All rights reserved. Engine: **LimML**.
+---
+
+## Operator & legal
+
+- **Brand / operator:** Veizik
+- **Registered business name:** LinkPick
+- **Governing law / jurisdiction:** Republic of Korea
+- **Business registration number:** available on request
+- **Payments:** Polar (Merchant of Record) — USD, tax handled at checkout
+- **Support:** [support@veizik.com](mailto:support@veizik.com)
+
+[Privacy](https://veizik.com/privacy.html) ·
+[Terms](https://veizik.com/terms.html) ·
+[Refunds](https://veizik.com/refund.html)
+
+Veizik is a proprietary local runtime, not open source. The engine (LimML) is not
+distributed as source. Installation and evaluation are free; production use requires a
+license.
+
+---
+
+© 2026 Veizik (operated by LinkPick, Republic of Korea) · powered by the LimML engine ·
+benchmarks are being finalized — see [veizik.com](https://veizik.com)
