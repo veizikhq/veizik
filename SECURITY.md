@@ -148,9 +148,15 @@ telemetry consent as a paywall would be a bug worth reporting.
 
 ### Secret handling
 
-- **The pack signing private key is offline.** It does not live on a build server, in CI, or in any
-  environment reachable from the network. Only the **public** key is distributed, embedded in the
-  client. There is no key material in this repository, and there is nothing here to leak.
+- **Signing keys are not in CI and not in this repository.** Pack and entitlement signing keys are
+  held on an operator-controlled workstation with owner-only permissions, and only the **public**
+  key is distributed (embedded in the client). No key material is in this repo.
+  *Accurately stated:* that workstation is also the machine that builds and signs releases, and it
+  runs other network-facing services. So the signing root is **not** air-gapped today — it is
+  operator-controlled and offline-from-CI, which is a weaker property. Treating it as air-gapped
+  would misdescribe our own root of trust. Moving signing to a removable/air-gapped store is on the
+  roadmap; until then, assume a full compromise of that workstation is a full compromise of the
+  signing root, and that is the threat we would have to respond to with key rotation.
 - **No secrets in the public repo.** Service credentials live in the deployment platform's secret
   store and are referenced by environment variable. If you ever find a credential committed here,
   that is a valid, high-severity report — send it to security@veizik.com rather than opening an

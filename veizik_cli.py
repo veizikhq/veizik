@@ -950,6 +950,12 @@ def cmd_run(args):
 
     # Universal render (T1 native where wired on host, else T2 diffusers/DiffSynth, else T3).
     rc = _universal_render(lu, card, plan, intent, out_path, args)
+    if rc == "dry-run":
+        return 0                          # plan validated only — no file, so nothing is counted
+    if rc == 0 and not os.path.exists(out_path):
+        print("\n[run] backend reported success but no file was written to %s — not counting it."
+              % out_path)
+        return 0
     if rc == 0:
         print("\n[run] OK -> %s" % out_path)
         ve.stamp(out_path, ent, intent.get("is_video", False))
@@ -1065,13 +1071,21 @@ def _cmd_direct(args, is_video):
     out = args.out or os.path.abspath("veizik_out" + (".mp4" if is_video else ".png"))
     rc = _do_render(lu, card, plan, prompt=args.prompt, negative=args.negative or "",
                     out_path=out, is_video=is_video, seed=args.seed, dry_run=args.dry_run)
-    if rc == 0:
+    if rc == "dry-run":
+        return 0                          # plan reported; nothing rendered, nothing counted
+    if rc == 0 and os.path.exists(out):
+        # Require the file to actually exist before calling it a success — the trial clock and the
+        # first-render upsell both hang off this signal.
         print("\n[%s] OK -> %s" % ("t2v" if is_video else "t2i", out))
         ve.stamp(out, ent, is_video)     # tier watermark (forced/weak -> visible+metadata; none -> metadata)
         # §14: same success signal as `veizik run` — only a real written file counts.
         _mark_render_success()
         _usage_note()
         return 0
+    if rc == 0:
+        print("\n[%s] backend reported success but no file was written to %s — not counting it."
+              % ("t2v" if is_video else "t2i", out))
+        return 1
     print("\n[%s] render backend unavailable on this host (%s). Plan is valid; run on the render host"
           " (see docstring) to produce the file." % ("t2v" if is_video else "t2i", rc))
     return 0  # direct command still reports the plan; not a hard failure of the drop-in
@@ -1108,7 +1122,10 @@ def _do_render(lu, card, plan, prompt, negative, out_path, is_video, seed=None, 
     if dry_run:
         print("[render] --dry-run: plan validated, no render performed.")
         _write_plan_sidecar(card, plan, prompt, out_path)
-        return 0
+        # Distinct from 0 on purpose. A dry run produces no file, so callers must not treat it as a
+        # render: counting it would start the 7-day trial clock, fire the "first render" upsell, and
+        # claim an output that does not exist.
+        return "dry-run"
     # Lazy heavy imports; absence => graceful reason (caller passes through / reports plan).
     try:
         import torch  # noqa: F401
@@ -2875,8 +2892,9 @@ def _microbench(device=None):
 
 
 def _ram_bucket(gb):
-    """Coarse RAM bucket. Telemetry gets a bucket, not the exact byte count, because the exact
-    figure is closer to a machine fingerprint than to a compatibility signal."""
+    """Coarse RAM bucket, reported as the bucket's UPPER edge (69 GB -> 128). Telemetry gets a
+    bucket, not the exact byte count, because the exact figure is closer to a machine fingerprint
+    than to a compatibility signal."""
     if not gb:
         return None
     for edge in (8, 16, 32, 64, 128, 256, 512):
