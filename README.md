@@ -3,7 +3,7 @@
 **Run local AI media workloads with hardware-aware compatibility checks and execution
 profiles.** Veizik checks your GPU and reports a runnable support tier and recommended
 execution profile. Rendering happens on hardware you own — no cloud render service, and
-your media and prompts stay on your machine. Powered by a native inference engine.
+your media and prompts stay on your machine. Powered by a native CUDA engine.
 
 This README describes only what the **public download actually does**. Anything not yet in
 the download is labeled as planned or experimental, on purpose.
@@ -23,7 +23,7 @@ the download is labeled as planned or experimental, on purpose.
 **Not yet public** (not in the download — do not read these as available today):
 - ComfyUI drop-in (`run` / `serve`) — ComfyUI integration, upcoming preview
 - TimeMachine preview build — planned for a Preview build
-- native inference engine assets — planned platform release assets
+- native CUDA DiT engine assets — planned platform release assets
 
 External reproduction so far: none. This is a Public Preview, and independent verification
 on your own hardware is exactly what it is for.
@@ -92,9 +92,11 @@ checked at the block/engine level against a reference implementation. This is an
 component-level numerical check — **not** an end-to-end generation benchmark — and no
 numerical-fidelity figure is published here until it is externally reproducible.
 
-**Render time / throughput:** intentionally left blank. Benchmarks are being finalized — see
-[veizik.com](https://veizik.com). No render-time numbers are published in this README until
-they are repeated and externally reproducible.
+**Render time / throughput:** the README body inlines no throughput number. The exact model,
+parameters, power-cap setup and verification, and the verified results published so far (each
+labelled with its verification status) are in [REPRODUCE.md](REPRODUCE.md) — re-run it and post
+your result; that external reproduction is exactly what unlocks comparative claims. See also
+[veizik.com](https://veizik.com).
 
 ---
 
@@ -119,34 +121,33 @@ Known limitations and the honest issue ledger: [KNOWN_ISSUES.md](KNOWN_ISSUES.md
 ## Pricing
 
 Pricing is a **local runtime license** — not cloud credits. You supply the GPU.
-Billing opens after Preview validation; nothing is charged today. Full details at
-[veizik.com/#pricing](https://veizik.com/#pricing).
+Full details at [veizik.com/#pricing](https://veizik.com/#pricing).
 
 | Plan | Price |
 | --- | --- |
-| Benchmark | $0 — install, hardware check, free entitlement, run the reproducible bench, experimental render |
-| Founding Creator | $19/mo or $149/yr — commercial output, stable profiles, 1 node |
-| Founding Pro | $49/mo or $399/yr — batch, API, advanced profiles, 2 nodes |
-| Studio Pilot | from $299/mo — 5 nodes, priority adapter, team dashboard |
-| OEM / Enterprise | by inquiry — $2,500–$10,000 evaluation; $25k–$250k+/yr SDK, redistribution, SLA |
+| Free Preview | $0 — install, hardware check, free entitlement, experimental render |
+| Founding Creator | **$19 / month** (or $149/year) |
+| Founding Pro | **$49 / month** (or $399/year) |
+| Studio Pilot | **from $299** — pilot evaluation |
+| Founding Lifetime | **$299 one-time** — first 200 seats, price locked for the life of the seat |
 
-### Founding Lifetime Edition
+Reservation (free key) is open now; **no payment is collected yet** — paid checkout is not live.
 
-An early-supporter program — a special license for the users who back early development,
-**not a discount tier**.
+### Founding Lifetime — first 200 seats
 
-- **$299 one-time · maximum 200 seats**
-- Sold **only during the launch window** — it closes when **200 seats** or **30 days** is reached, whichever comes first, and is **never sold again**.
-- **Lifetime includes:** every current feature, all future Runtime updates, bug fixes, the same major version.
-- **Not included** (these stay on their own plans): Enterprise features, OEM, cluster / multi-node, dedicated optimization, enterprise support, new large-model Capsules, paid AI-service credits.
-- It is a lifetime **Runtime**, not lifetime everything.
+The first 200 Founding Lifetime seats ($299 one-time) get:
 
-Miss the lifetime window? **Founder Pro (annual)** stays open at **$149/yr**, ongoing.
+- Lifetime license, price locked for the life of the seat
+- Founder feedback access
+- Priority compatibility support
 
 **License unit — a personal seat, not a PC.** One user may register up to **2 computers**
 and run on **1 at a time** (concurrency is what is metered, never install count). Device
 change is self-service up to 3×/year; registration binds to a machine fingerprint, not the
 GPU alone, so a GPU swap does not break the license.
+
+The Founding-Lifetime counter (first 200 seats) is computed server-side from **real paid
+purchases only** (not checkout starts).
 
 ---
 
@@ -169,5 +170,5 @@ license.
 
 ---
 
-© 2026 Veizik (operated by LinkPick, Republic of Korea) · powered by a native inference engine ·
+© 2026 Veizik (operated by LinkPick, Republic of Korea) · powered by a native CUDA engine ·
 benchmarks are being finalized — see [veizik.com](https://veizik.com)
