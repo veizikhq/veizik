@@ -1,0 +1,22 @@
+{
+  "runs": 4,
+  "wall_s_median": 49.25,
+  "wall_s_min": 48.8,
+  "wall_s_max": 50.5,
+  "wall_s_stdev_pop": 0.64,
+  "wall_s_stdev_sample": 0.74,
+  "load_s_median": 15.2,
+  "peak_vram_gb": 12.78,
+  "peak_vram_spread_gb": 0.0,
+  "power_limit_w": 420,
+  "power_draw_observed_peak_w": 418.78,
+  "model": "black-forest-labs/FLUX.1-dev",
+  "task": "t2i",
+  "resolution": "1024x1024",
+  "steps": 24,
+  "seed": 42,
+  "date": "2026-07-22",
+  "note": "all 4 WARM runs pooled; 1 cold run (83.6s, 89.7s first-load) excluded as warmup",
+  "gpu": "RTX 3090 24GB",
+  "power_condition": "420W verified (observed >400W under load)"
+}
