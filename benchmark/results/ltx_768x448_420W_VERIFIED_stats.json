@@ -1,0 +1,22 @@
+{
+  "runs": 5,
+  "wall_s_median": 18.5,
+  "wall_s_min": 17.4,
+  "wall_s_max": 20.4,
+  "wall_s_stdev": 0.97,
+  "load_s_median": 7.4,
+  "peak_vram_gb": 9.55,
+  "peak_vram_spread_gb": 0.0,
+  "power_limit_w": 420,
+  "power_draw_observed_peak_w": 418.78,
+  "date": "2026-07-22",
+  "model": "Lightricks/LTX-Video",
+  "task": "t2v",
+  "resolution": "768x448",
+  "frames": 49,
+  "steps": 30,
+  "fps": 24,
+  "seed": 42,
+  "gpu": "RTX 3090 24GB",
+  "power_condition": "420W verified (observed >400W under load)"
+}
