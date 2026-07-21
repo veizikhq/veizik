@@ -103,18 +103,17 @@ is attached as each result is packaged for external reproduction.
 
 | Model | Workload | Wall (median) | Range | Runs | Peak VRAM | Peak host RAM | Status |
 |---|---|---|---|---|---|---|---|
-| LTX-Video | 768×448 · 49f · 30 steps | **18.5 s** | 17.4–20.4 s | 5 | 9.55 GB | *not captured* | internal · repeated · 420 W verified |
-| FLUX.1-dev | 1024² · 24 steps | **49.25 s** | 48.8–50.5 s | 4 warm | 12.78 GB | *not captured* | internal · repeated · 420 W verified |
+| LTX-Video | 768×448 · 49f · 30 steps | **18.5 s** | 17.4–20.4 s | 5 | 9.55 GB | ~18.7 GB | internal · repeated · 420 W verified |
+| FLUX.1-dev | 1024² · 24 steps | **49.25 s** | 48.8–50.5 s | 4 warm | 12.78 GB | ~45.2 GB | internal · repeated · 420 W verified |
 | CogVideoX-2b | 720×480 · 49f · 50 steps | **195.2 s** | 195–213 s | 3 | 16.29 GB | ~18.6 GB | internal · repeated · 420 W verified |
 | Wan 2.1 T2V-1.3B | 832×480 · 49f · 30 steps | **149.4 s** | 149–150 s | 3 | 11.60 GB | ~23.4 GB | internal · repeated · 420 W verified |
 | Wan 2.1 T2V-14B | 832×480 · 49f · 30 steps (seq offload) | **854.5 s** | — | 1 | 16.68 GB | **94.9 GB** | internal · single · 420 W verified |
 | Step-Video T2V 30B | 992×544 · 51f · 30 steps | **1730 s** | — | 1 | 12.48 GB | **96.0 GB** | internal · single · 420 W verified |
-| HunyuanVideo | 720×480 · 49f · 30 steps | — | — | — | — | — | did not complete (see notes) |
+| HunyuanVideo | 720×480 · 49f · 30 steps | **296.5 s** | — | 1 | 9.85 GB | 40.6 GB | internal · single · 420 W verified |
 
 Two things a buyer should read off this: (1) the large models keep **peak VRAM low (12–17 GB)** by streaming
 weights, but at the cost of **~95 GB host RAM** — so the real requirement for the 14B/30B tiers is a 24 GB GPU
-**plus ~96 GB system RAM**. (2) HunyuanVideo did not complete in this batch (both the DiffSynth and the diffusers
-paths errored); it is intentionally left blank rather than shown with a number, and will be re-run.
+**plus ~96 GB system RAM**. (2) HunyuanVideo now completes after a DiffSynth block-swap fix (RMSNorm wrapper attribute handling): 9.85 GB VRAM + 40.6 GB RAM, wall ~296 s.
 
 ## 5. What a Veizik number means
 
