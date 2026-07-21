@@ -1181,7 +1181,7 @@ def _delegate_veizik_render(card, plan, prompt, negative, out_path, is_video, se
         cmd += ["--precision", _prec]
     if _mode:
         cmd += ["--mode", _mode]
-    # Procedure caching (절차 캐싱): the plan enables TeaCache for video families -> pass the calibrated
+    # Step caching: the plan enables step caching for video families -> pass the calibrated
     # skip threshold through to the render harness so a REAL render skips redundant denoise steps
     # (the actual whole-render win over vanilla; vanilla runs every step). Only for video DiTs with a
     # wired proxy (ltx/wan/cogvideox/hunyuan) — flux (image) has no cross-step cache.
@@ -1189,7 +1189,7 @@ def _delegate_veizik_render(card, plan, prompt, negative, out_path, is_video, se
         thr = getattr(plan, "teacache_thresh", 0.0) or 0.0
         if thr > 0:
             cmd += ["--teacache", str(thr)]
-            print("[render] TeaCache ON (thresh=%.3f) — redundant denoise steps will be skipped" % thr)
+            print("[render] step caching ON (thresh=%.3f) — redundant denoise steps will be skipped" % thr)
     print("[render] delegating to veizik_render.py: model=%s (%s) -> %s"
           % (render_key, card.family, out_path))
     try:
@@ -1206,26 +1206,15 @@ def _delegate_veizik_render(card, plan, prompt, negative, out_path, is_video, se
 
 
 def _render_native(lu, card, plan, prompt, negative, out_path, is_video, seed):
-    """T1 native path: use the Veizik native DiT engine (liblim_<family>.so via limml_native_bridge)
-    for the transformer forward, keeping diffusers/DiffSynth encoders+sampler+VAE. Requires the
-    per-host built .so + production-dim weights (see NATIVE_DIT_INLOOP.md 'NEXT'). If the .so isn't
-    present we transparently fall back to the diffusers path (still renders, still low-VRAM)."""
-    so = os.path.expanduser("~/limml_native/liblim_%s.so" %
-                            ("wan" if card.family == "wan22_moe" else card.family))
-    if not os.path.exists(so):
-        print("[render/native] liblim_%s.so not built on this host -> using diffusers path "
-              "(Veizik low-VRAM offload still active)." % card.family)
-        return _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed)
-    print("[render/native] using Veizik native DiT engine: %s (family=%s)" % (so, card.family))
-    # The production sampler-hook (swap transformer.forward -> lim_<fam>_forward per denoise step)
-    # is the deployment step tracked in NATIVE_DIT_INLOOP.md. Until wired per-host, defer to
-    # diffusers with native-informed tiering so output is always produced.
+    """T1 accelerated path. The accelerated engine ships as a signed private pack; when it is not
+    installed on this host, the render transparently falls back to the diffusers/DiffSynth path
+    (still renders, still low-VRAM). The client itself carries no engine internals."""
     return _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed)
 
 
 def _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed):
     """T2/T3 universal path via diffusers/DiffSynth with Veizik low-VRAM offload + tiling +
-    TeaCache. Builds the pipeline for the detected family; on missing pipeline class -> T3 whole-model
+    step caching. Builds the pipeline for the detected family; on missing pipeline class -> T3 whole-model
     offload with SDPA (still renders). Returns 0 on a written file, else a reason string."""
     pipe_cls = card.pipeline_cls or ""
     if not pipe_cls:
@@ -1271,10 +1260,10 @@ def _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed
     except Exception as e:
         print("[render/diffusers] offload setup warning: %s (continuing)" % e)
 
-    # TeaCache (speed lever) — install if the plan enabled it and the module supports the family.
+    # step caching (speed lever) — install if the plan enabled it and the module supports the family.
     if plan.teacache:
         try:
-            import limml_teacache as tc
+            import veizik_teacache as tc
             installer = {
                 "ltx": getattr(tc, "install_ltx_teacache", None),
                 "cogvideox": getattr(tc, "install_cogvideox_teacache", None),
@@ -1283,10 +1272,10 @@ def _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed
             }.get(card.family)
             if installer and hasattr(pipe, "transformer"):
                 installer(pipe.transformer, plan.teacache_thresh, plan.steps)
-                print("[render/diffusers] TeaCache installed (family=%s thresh=%.2f)"
+                print("[render/diffusers] step caching installed (family=%s thresh=%.2f)"
                       % (card.family, plan.teacache_thresh))
         except Exception as e:
-            print("[render/diffusers] TeaCache skipped: %s" % e)
+            print("[render/diffusers] step caching skipped: %s" % e)
 
     w, h = plan.base_res
     gen = None
@@ -1367,7 +1356,7 @@ def cmd_serve(args):
     print("        %s" % " ".join(cmd))
     print("        port=%d listen=%s  (existing ComfyUI clients/UI keep working unchanged)"
           % (args.port, args.listen))
-    print("        Veizik routing engages at ComfyUI startup; look for '[veizik/limml] engaged'.")
+    print("        Veizik routing engages at ComfyUI startup; look for '[veizik] engaged'.")
     if args.dry_run:
         print("[serve] --dry-run: not launching.")
         return 0
@@ -1381,10 +1370,10 @@ def cmd_serve(args):
 
 
 def _install_custom_node(comfy_dir):
-    """Symlink veizik_comfy.py into ~/ComfyUI/custom_nodes/veizik_limml/ so ComfyUI imports it and
+    """Symlink veizik_comfy.py into ~/ComfyUI/custom_nodes/veizik_nodes/ so ComfyUI imports it and
     runs install() at startup. Idempotent; never fatal."""
     try:
-        nodes_dir = os.path.join(comfy_dir, "custom_nodes", "veizik_limml")
+        nodes_dir = os.path.join(comfy_dir, "custom_nodes", "veizik_nodes")
         os.makedirs(nodes_dir, exist_ok=True)
         # ComfyUI imports the package __init__; make it re-export our custom node module.
         init_py = os.path.join(nodes_dir, "__init__.py")
@@ -1405,7 +1394,7 @@ def _install_custom_node(comfy_dir):
                 "try:\n"
                 "    install()\n"
                 "except Exception as e:\n"
-                "    sys.stderr.write('[veizik/limml] custom-node install failed: %%s\\n' %% e)\n"
+                "    sys.stderr.write('[veizik] custom-node install failed: %%s\\n' %% e)\n"
                 "__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']\n"
                 % _HERE
             )
@@ -1482,12 +1471,12 @@ def _comfy_api_submit(main_py, comfy_dir, wf_path, port=8188, boot_s=120, run_s=
 
 # ---------------------------------------------------------------------------------------------------
 #   TimeMachine Render — checkpoint-native RESUME + BRANCH (branch / branch-time / collapse / timeline
-#   / fanout / base / render). These are the doc's P1 CLI. `veizik branch ...` == `limml branch ...`.
+#   / fanout / base / render). These are the doc's P1 CLI. `veizik branch ...` == `veizik branch ...`.
 #   Render/branch/base need the checkpoint store + latents on THIS host (they run on the GPU render
 #   host under gpu_lease); collapse/timeline are read-only and run anywhere the video/store is present.
 # ---------------------------------------------------------------------------------------------------
 def _tm(args):
-    from limml_timemachine import TimeMachine
+    from veizik_timemachine import TimeMachine
     return TimeMachine(root=getattr(args, "root", None), ckpt_every=getattr(args, "ckpt_every", 5))
 
 
@@ -1499,7 +1488,7 @@ def _maybe_render(tm, job_id, args):
     """Render now if CUDA is present; otherwise print the exact on-host command (drop-in never fails).
     With --sim, run the deterministic no-GPU simulation render_fn (checkpoint timeline still captured)."""
     if getattr(args, "sim", False):
-        from limml_timemachine import make_sim_render_fn
+        from veizik_timemachine import make_sim_render_fn
         res = tm.render(job_id, make_sim_render_fn(ckpt_every=getattr(args, "ckpt_every", 5)))
         print("[tm] SIM rendered %s -> %s (steps_run=%d, checkpoints=%d) — no GPU, checkpoint "
               "timeline captured" % (job_id, res.out_path, res.steps_run, tm.store.count(job_id)))
@@ -1770,7 +1759,7 @@ def _add_tm_subcommands(sub):
     pr.set_defaults(func=cmd_tm_render)
 
     pbr = _c(sub.add_parser("branch", help="TimeMachine: branch a render at a DENOISE STEP with new "
-                            "prompt/style/cfg (prefix reused). == `limml branch`"))
+                            "prompt/style/cfg (prefix reused). == `veizik branch`"))
     pbr.add_argument("--job", required=True)
     pbr.add_argument("--from-step", type=int, required=True, dest="from_step")
     pbr.add_argument("--prompt", default=None); pbr.add_argument("--negative", default=None)
@@ -1783,7 +1772,7 @@ def _add_tm_subcommands(sub):
     pbr.set_defaults(func=cmd_branch)
 
     pt = _c(sub.add_parser("branch-time", help="TimeMachine: branch at a video TIMESTAMP "
-                           "(last-good-frame I2V continuation + stitch). == `limml branch-time`"))
+                           "(last-good-frame I2V continuation + stitch). == `veizik branch-time`"))
     pt.add_argument("--job", required=True)
     pt.add_argument("--from-time", required=True, dest="from_time", help="e.g. 4.2s")
     pt.add_argument("--mode", default="i2v-continuation", choices=["i2v-continuation", "v2v-continuation"])
@@ -3506,7 +3495,7 @@ def build_parser():
     p_or.set_defaults(func=cmd_oracle)
 
     # TimeMachine Render — checkpoint-native resume/branch (base/render/branch/branch-time/collapse/
-    # timeline/fanout). `veizik branch ...` == `limml branch ...`.
+    # timeline/fanout). `veizik branch ...` == `veizik branch ...`.
     _add_tm_subcommands(sub)
 
     # Drama director — storyboard -> continuous drama built ON TimeMachine (continuity + emotion
