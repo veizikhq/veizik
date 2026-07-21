@@ -3,7 +3,7 @@
 **Run local AI media workloads with hardware-aware compatibility checks and execution
 profiles.** Veizik checks your GPU and reports a runnable support tier and recommended
 execution profile. Rendering happens on hardware you own — no cloud render service, and
-your media and prompts stay on your machine. Powered by the LimML engine.
+your media and prompts stay on your machine. Powered by a native CUDA engine.
 
 This README describes only what the **public download actually does**. Anything not yet in
 the download is labeled as planned or experimental, on purpose.
@@ -157,11 +157,11 @@ checkout starts).
 [Terms](https://veizik.com/terms.html) ·
 [Refunds](https://veizik.com/refund.html)
 
-Veizik is a proprietary local runtime, not open source. The engine (LimML) is not
+Veizik is a proprietary local runtime, not open source. The engine is not
 distributed as source. Installation and evaluation are free; production use requires a
 license.
 
 ---
 
-© 2026 Veizik (operated by LinkPick, Republic of Korea) · powered by the LimML engine ·
+© 2026 Veizik (operated by LinkPick, Republic of Korea) · powered by a native CUDA engine ·
 benchmarks are being finalized — see [veizik.com](https://veizik.com)
