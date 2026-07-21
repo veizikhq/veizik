@@ -1,0 +1,22 @@
+CAMPAIGN2 START 2026-07-21T16:52:02Z CVD=1 free=47GB time_bin=/usr/bin/time
+>>> cog-r1 (cogvideox) start 16:52:03 free=47GB
+cog-r1 | model=cogvideox | proc=227.1s rc=0 peak_ram_gb=17.9 | [done] wall=213.2s  load=7.0s  peak_vram=16.29GB  reserved=21.87GB   | ERR:
+>>> cog-r2 (cogvideox) start 16:55:50 free=47GB
+cog-r2 | model=cogvideox | proc=209.9s rc=0 peak_ram_gb=18.6 | [done] wall=195.2s  load=7.3s  peak_vram=16.29GB  reserved=21.87GB   | ERR:
+>>> cog-r3 (cogvideox) start 16:59:20 free=47GB
+cog-r3 | model=cogvideox | proc=208.8s rc=0 peak_ram_gb=17.5 | [done] wall=195.2s  load=6.3s  peak_vram=16.29GB  reserved=21.87GB   | ERR:
+>>> wan13b-r1 (wan13b) start 17:02:48 free=47GB
+wan13b-r1 | model=wan13b | proc=166.4s rc=0 peak_ram_gb=23.4 | [done] wall=149.8s  load=7.3s  peak_vram=11.60GB  reserved=11.64GB   | ERR:
+>>> wan13b-r2 (wan13b) start 17:05:35 free=47GB
+wan13b-r2 | model=wan13b | proc=165.9s rc=0 peak_ram_gb=21.0 | [done] wall=149.4s  load=7.2s  peak_vram=11.60GB  reserved=11.64GB   | ERR:
+>>> wan13b-r3 (wan13b) start 17:08:21 free=47GB
+wan13b-r3 | model=wan13b | proc=165.6s rc=0 peak_ram_gb=23.2 | [done] wall=149.2s  load=7.1s  peak_vram=11.60GB  reserved=11.64GB   | ERR:
+>>> wan14b (wan) start 17:11:06 free=47GB
+wan14b | model=wan | proc=891.4s rc=0 peak_ram_gb=94.9 | [done] wall=854.5s  load=24.3s  peak_vram=16.68GB  reserved=17.29GB   | ERR:
+>>> hunyuan_ds (hunyuan_ds) start 17:25:58 free=47GB
+hunyuan_ds | model=hunyuan_ds | proc=159.4s rc=1 peak_ram_gb=40.1 |  | ERR:Traceback (most recent call last):
+>>> hunyuan (hunyuan) start 17:28:37 free=47GB
+hunyuan | model=hunyuan | proc=479.7s rc=1 peak_ram_gb=52.8 |  | ERR:Traceback (most recent call last):
+>>> stepvideo (stepvideo) start 17:36:37 free=47GB
+stepvideo | model=stepvideo | proc=1889.2s rc=0 peak_ram_gb=96.0 | [done] wall=1730.3s  load=151.6s  peak_vram=12.48GB  reserved=14.62GB   | ERR:[load] optimus lib skipped (OSError)
+CAMPAIGN2 DONE 2026-07-21T18:08:06Z free=47GB
