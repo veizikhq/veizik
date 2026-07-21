@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""LimML Universal Runtime — auto-detect ANY diffusion DiT, auto-tune tiers/backend/TeaCache to the
-hardware, and apply BOTH the memory-tiering AND speed levers + the commercial quality pipeline through
-a thin per-model adapter. Packaged for a broad commercial flagship ("supports all models").
+"""Veizik Universal Runtime — auto-detect a diffusion model family, probe the hardware, and produce an
+auto-tuned execution plan (support tier, dtype, attention backend, caching, offload strategy, sampler).
+The public planner for a broad model-family surface.
 
 TIERS OF SUPPORT (honest):
-  T1 native-CUDA peak  : full BlockSpec wired (Step-Video today) -> limml_dit_*.cu in-loop engine.
-  T2 universal auto    : tiering + attention-accel + TeaCache + dtype + quality, via diffusers/DiffSynth.
-  T3 unknown best-effort: confidence<0.6 -> whole-model offload + SDPA, no advanced levers, STILL RENDERS.
+  T1 native      : a native engine path is available for this family (shipped in the private runtime pack).
+  T2 universal   : hardware-aware planning (offload + attention + caching + dtype), via diffusers/DiffSynth.
+  T3 best-effort : confidence<0.6 -> whole-model offload + SDPA, no advanced levers, STILL RENDERS.
 
-Design source: workflow wijs6nsh7 (5-subsystem design). This module implements the ModelCard registry,
-AutoDetect, hardware probe, and the autotune planner. Render binding uses the proven diffusers path.
-Run:  python3 limml_universal.py --detect <model_path>        # print card + auto-tuned RunPlan
-      python3 limml_universal.py --detect-config <config.json> # detect from a raw config
-      python3 limml_universal.py --selftest                    # detect+plan all built-in families
+This module implements the model-family registry, auto-detect, hardware probe, and the autotune planner.
+Run:  python3 veizik_universal.py --detect <model_path>         # print card + auto-tuned plan
+      python3 veizik_universal.py --detect-config <config.json> # detect from a raw config
+      python3 veizik_universal.py --selftest                    # detect+plan all built-in families
 """
 import os, sys, json, argparse, glob
 from dataclasses import dataclass, field, asdict
@@ -48,7 +47,7 @@ class ModelCard:
     prefers_bf16: bool = True
     int8_safe: bool = False
     int4_safe: bool = False
-    # teacache: AdaLN-modulated L1-delta proxy. None => auto-disabled (no clean proxy).
+    # caching capability flag for this family (None => auto-disabled).
     teacache_ok: bool = True
     teacache_thresh: float = 0.10
     teacache_warmup: int = 3
@@ -59,7 +58,7 @@ class ModelCard:
     # sampler (the load-bearing per-model field)
     sampler: SamplerSpec = field(default_factory=SamplerSpec)
     # native tier-1
-    native_wmma: bool = False          # limml_dit_*.cu block-wired for this arch
+    native_engine: bool = False          # True if a native engine path is available for this family
     # crash-resilience: True if the pipeline exposes a per-step latent callback (diffusers
     # callback_on_step_end / DiffSynth) so a render can RESUME from the last saved latent. False =>
     # opaque black-box pipeline (no mid-render state) -> whole-job retry (still crash-isolated).
@@ -67,65 +66,18 @@ class ModelCard:
     notes: str = ""
 
 # ---------------------------------------------------------------------------------------------------
-#   Tier-1 BlockSpec — the FULL block wiring a native-CUDA in-loop engine needs (per model).
-#   Populated => the model can be run in the LimML C engine (limml_dit_*.cu). Today only Step-Video
-#   is native-complete (verified rel 2.35e-6); LTX/Wan specs below are the architecture descriptors
-#   that a future native kernel consumes. Writing+verifying each native kernel is a multi-session build.
+#   Native-engine availability per family. The compiled native engine ships in the private runtime
+#   pack (entitlement-gated); this public map only records WHICH families have a native path, so the
+#   support-tier table can show it. No engine internals are described here.
 # ---------------------------------------------------------------------------------------------------
 @dataclass
 class BlockSpec:
-    n_blocks: int = 0
-    hidden: int = 0
-    n_heads: int = 0
-    head_dim: int = 0
-    stream_layout: str = "single"          # single | dual->single | dual_expert_moe
-    norm: str = "adaln_single"             # adaln_single | adaln_zero | layernorm | rmsnorm
-    ffn: str = "gated_gelu"                # gated_gelu | gelu | moe
-    rope: str = "rope3d"                   # rope3d | rope2d | rope1d | none
-    rope_ch_split: List[int] = field(default_factory=list)  # e.g. [64,32,32] (Step-Video)
-    rope_rotate: str = "rotate_half"       # rotate_half | interleave
-    qk_norm: str = "rms"
-    qkv_fused: bool = True                 # wqkv fused vs split
-    cross_attn: bool = True
-    native_status: str = "TODO"            # DONE (verified rel) | TODO (kernel not written)
-    ref_asset: str = ""                    # the .cu reference if DONE
+    native_status: str = "TODO"            # DONE = native engine path available | TODO = universal path only
 
-# ★ 5/5 flagship native DiT blocks VERIFIED bit-exact vs diffusers (single-block + N-layer streaming +
-#   fp16 tensor-core), 2026-07-07. Each <model>_dit_exact.cu (fp32 gold) + <model>_full.cu (NL loop +
-#   fp16-TC). rel = verified fp32-gold / fp16-TC pair. All run via gpu_lease on GPU1.
 BLOCK_SPECS: Dict[str, BlockSpec] = {
-    "stepvideo": BlockSpec(n_blocks=48, hidden=6144, n_heads=48, head_dim=128, stream_layout="single",
-        norm="adaln_single", ffn="gated_gelu", rope="rope3d", rope_ch_split=[64,32,32],
-        rope_rotate="rotate_half", qk_norm="rms", qkv_fused=True, cross_attn=True,
-        native_status="DONE", ref_asset="limml_dit_exact.cu (rel 2.35e-6), limml_dit_full_opt.cu (wmma+teacache)"),
-    "ltx": BlockSpec(n_blocks=28, hidden=2048, n_heads=32, head_dim=64, stream_layout="single",
-        norm="adaln_single", ffn="gated_gelu", rope="rope_complex_interleave", rope_rotate="interleave",
-        qk_norm="rms_across_heads", qkv_fused=False, cross_attn=True,
-        native_status="DONE", ref_asset="ltx_dit_exact.cu (rel 1.94e-7), ltx_full.cu (NL=4 exact 2.9e-7 / fp16-TC 3.3e-4)"),
-    "cogvideox": BlockSpec(n_blocks=30, hidden=1920, n_heads=30, head_dim=64, stream_layout="joint",
-        norm="adaln_zero", ffn="gelu", rope="rope_interleave", rope_rotate="interleave",
-        qk_norm="layernorm", qkv_fused=False, cross_attn=False,
-        native_status="DONE", ref_asset="cog_dit_exact.cu (rel 8.4e-7), cog_full.cu (NL=4 exact 1.1e-6 / fp16-TC 5.0e-4)"),
-    "hunyuanvideo": BlockSpec(n_blocks=60, hidden=3072, n_heads=24, head_dim=128, stream_layout="dual->single",
-        norm="adaln", ffn="gelu", rope="rope_interleave", rope_rotate="interleave",
-        qk_norm="rms", qkv_fused=False, cross_attn=False,
-        native_status="DONE", ref_asset="hunyuan_dit_exact.cu (dual 3.6e-6/single 5.1e-6), hunyuan_full.cu (exact 4e-6 / fp16-TC 5.2e-4)"),
-    "wan": BlockSpec(n_blocks=40, hidden=5120, n_heads=40, head_dim=128, stream_layout="single",
-        norm="adaln_single", ffn="gelu_approx", rope="rope_interleave_3axis", rope_rotate="interleave",
-        qk_norm="rms_across_heads", qkv_fused=False, cross_attn=True,
-        native_status="DONE", ref_asset="wan_dit_exact.cu (rel 5.53e-7), wan_full.cu (NL=4 exact 1.1e-6 / fp16-TC 2.5e-4)"),
-    "flux": BlockSpec(n_blocks=57, hidden=3072, n_heads=24, head_dim=128, stream_layout="dual->single",
-        norm="adaln_zero", ffn="gelu", rope="rope_interleave", rope_rotate="interleave",
-        qk_norm="rms", qkv_fused=False, cross_attn=False,
-        # FLUX.1-dev image MMDiT: 19 double (joint) + 38 single. VERIFIED via the full N-layer engine
-        # (flux_full.cu) matching the diffusers 4+4-block stack; the standalone single-block verifier
-        # flux_dit_exact.cu has a separate ref-construction bug (non-blocking, full engine is authoritative).
-        native_status="DONE", ref_asset="flux_full.cu (NL exact 4.58e-7 / fp16-TC 1.15e-4); axes_dims_rope=(16,56,56), concat [txt|img]"),
-    "wan22_moe": BlockSpec(n_blocks=40, hidden=5120, n_heads=40, head_dim=128, stream_layout="dual_expert_moe",
-        norm="adaln_single", ffn="gated_gelu", rope="rope3d", rope_rotate="rotate_half",
-        qk_norm="rms", qkv_fused=False, cross_attn=True,
-        native_status="TODO",  # Wan2.2 MoE (dual-expert) reuses the verified "wan" block per expert; MoE routing = next
-        ref_asset="reuses wan_full.cu block per expert; MoE routing/streaming = next"),
+    "stepvideo": BlockSpec("DONE"), "ltx": BlockSpec("DONE"), "cogvideox": BlockSpec("DONE"),
+    "hunyuanvideo": BlockSpec("DONE"), "wan": BlockSpec("DONE"), "flux": BlockSpec("DONE"),
+    "wan22_moe": BlockSpec("TODO"),
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -142,7 +94,7 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=32, vae_temporal_comp=8, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="flow_match", time_shift=6.0, default_steps=30,
                             cfg_hi=3.0, cfg_lo=3.0, cfg_zero_star=False),
-        native_wmma=True, notes="realtime latent-diffusion, native long-shot; commercial-designed. NATIVE DiT verified (ltx_full.cu, exact 2.9e-7/fp16-TC 3.3e-4)."),
+        native_engine=True, notes="Realtime latent-diffusion video; native engine path available."),
     "stepvideo": ModelCard(
         family="stepvideo", kind="video", pipeline_cls="diffsynth.StepVideoPipeline",
         block_container_paths=["transformer.transformer_blocks"],
@@ -152,7 +104,7 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=16, vae_temporal_comp=8, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="flow_match", time_shift=13.0, default_steps=50,
                             cfg_hi=9.0, cfg_lo=5.0, cfg_zero_star=True),
-        native_wmma=True, notes="30B; ONLY model with native-CUDA wmma+TeaCache (Tier-1). shift=13 critical."),
+        native_engine=True, notes="30B; native engine path (Tier-1). time_shift=13 is critical."),
     "wan22_moe": ModelCard(
         family="wan22_moe", kind="video", pipeline_cls="diffsynth.WanPipeline",
         transformer_attrs=["transformer", "transformer_2"],
@@ -163,7 +115,7 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=8, vae_temporal_comp=4, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="unipc", time_shift=5.0, default_steps=24,
                             cfg_hi=7.0, cfg_lo=4.0, cfg_zero_star=True),
-        native_wmma=False, notes="dual-expert MoE: high-noise->low-noise at boundary. inactive expert=cold capacity. Wan2.1 single-stream block NATIVE-verified (wan_full.cu, exact 1.1e-6/fp16-TC 2.5e-4); MoE routing over that block = next."),
+        native_engine=False, notes="Dual-expert MoE (high-noise->low-noise at boundary); inactive expert = cold capacity. Native path for the base block; MoE routing on the roadmap."),
     "hunyuanvideo": ModelCard(
         family="hunyuanvideo", kind="video", pipeline_cls="diffusers.HunyuanVideoPipeline",
         block_container_paths=["transformer.transformer_blocks", "transformer.single_transformer_blocks"],
@@ -173,7 +125,7 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=8, vae_temporal_comp=4, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="flow_match", time_shift=7.0, default_steps=30,
                             cfg_hi=6.0, cfg_lo=6.0, cfg_zero_star=False),
-        native_wmma=True, notes="MMDiT: dual-stream + single-stream joint attn. strong for humans. NATIVE DiT verified (hunyuan_full.cu, exact 4e-6/fp16-TC 5.2e-4)."),
+        native_engine=True, notes="MMDiT joint attention; strong for humans. Native engine path available."),
     "cogvideox": ModelCard(
         family="cogvideox", kind="video", pipeline_cls="diffusers.CogVideoXPipeline",
         block_container_paths=["transformer.transformer_blocks"],
@@ -183,7 +135,7 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=8, vae_temporal_comp=4, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="ddim", time_shift=1.0, default_steps=50,
                             cfg_hi=6.0, cfg_lo=6.0, cfg_zero_star=False),
-        native_wmma=True, notes="3D-VAE, joint text-video attn. NATIVE DiT verified (cog_full.cu, exact 1.1e-6/fp16-TC 5.0e-4)."),
+        native_engine=True, notes="3D-VAE, joint text-video attention. Native engine path available."),
     "flux": ModelCard(
         family="flux", kind="image", pipeline_cls="diffusers.FluxPipeline",
         block_container_paths=["transformer.transformer_blocks", "transformer.single_transformer_blocks"],
@@ -193,12 +145,12 @@ FAMILY_TEMPLATES: Dict[str, ModelCard] = {
         vae_spatial_comp=8, vae_temporal_comp=1, vae_tiling_ok=True,
         sampler=SamplerSpec(scheduler="flow_match", time_shift=1.15, default_steps=28,
                             cfg_hi=3.5, cfg_lo=3.5, cfg_zero_star=False),
-        native_wmma=True, notes="image MMDiT; time_shift resolution-dependent. NATIVE DiT verified (flux_full.cu, exact 4.58e-7/fp16-TC 1.15e-4)."),
+        native_engine=True, notes="Image MMDiT; time_shift resolution-dependent. Native engine path available."),
 }
 
 # unknown -> honest safe path
 UNKNOWN_CARD = ModelCard(family="unknown", confidence=0.0, block_container_paths=[],
-                         teacache_ok=False, native_wmma=False,
+                         teacache_ok=False, native_engine=False,
                          notes="T3 best-effort: whole-model offload + SDPA, no advanced levers.")
 
 # ---------------------------------------------------------------------------------------------------
@@ -324,7 +276,7 @@ class RunPlan:
     offload: str = "model_cpu_offload" # resident|model_cpu_offload|sequential_cpu_offload|native_tier
     dtype: str = "bf16"
     quant: str = "none"                # none|int8|int4
-    attention: str = "sdpa_meff"       # wmma_native|flash|sage|sdpa_meff
+    attention: str = "sdpa_meff"       # native|flash|sage|sdpa_meff
     teacache: bool = False
     teacache_thresh: float = 0.0
     vae_tiling: bool = True
@@ -354,7 +306,7 @@ def autotune(card: ModelCard, hw: HwProfile, target: str = "commercial_10s",
         p.support_tier = "T3"; p.offload = "sequential_cpu_offload"; p.attention = "sdpa_meff"
         p.teacache = False; p.provenance["reason"] = "confidence<0.6 -> safe path"
         return p
-    p.support_tier = "T1" if card.native_wmma else "T2"
+    p.support_tier = "T1" if card.native_engine else "T2"
 
     # ---- dtype ----
     p.dtype = "bf16" if card.prefers_bf16 else "fp16"
@@ -365,8 +317,8 @@ def autotune(card: ModelCard, hw: HwProfile, target: str = "commercial_10s",
     p.cfg_hi, p.cfg_lo, p.cfg_zero_star = s.cfg_hi, s.cfg_lo, s.cfg_zero_star
 
     # ---- attention ladder ----
-    if card.native_wmma and hw.sm >= 80:
-        p.attention = "wmma_native"
+    if card.native_engine and hw.sm >= 80:
+        p.attention = "native"
     else:
         p.attention = "flash"   # torch SDPA flash backend; falls to sdpa_meff if unavailable at runtime
 
@@ -389,12 +341,12 @@ def autotune(card: ModelCard, hw: HwProfile, target: str = "commercial_10s",
         if hot >= nblk:
             p.offload = "resident"
         elif hw.nvlink and hw.n_gpus >= 2:
-            p.offload = "native_tier" if card.native_wmma else "model_cpu_offload"  # warm-NVLink via native; else diffusers offload
+            p.offload = "native_tier" if card.native_engine else "model_cpu_offload"  # warm-NVLink via native; else diffusers offload
         else:
             p.offload = "model_cpu_offload"
         # quant only if it buys residency (WSL streaming is non-overlappable -> worth it)
-        if hot < nblk and card.int4_safe and card.native_wmma:
-            p.quant = "int4"; p.offload = "native_tier"  # 30B->13.7GB resident (Step-Video)
+        if hot < nblk and card.int4_safe and card.native_engine:
+            p.quant = "int4"; p.offload = "native_tier"  # quant buys full residency
             p.provenance["quant_reason"] = "int4 buys full residency, kills streaming"
         elif hot < nblk and card.int8_safe and hw.is_wsl:
             p.provenance["quant_note"] = "int8 could raise residency (needs calibration receipt)"
@@ -509,7 +461,7 @@ def plan_render_farm(hw: HwProfile, cards: List[ModelCard], target: str = "comme
 
 # ---------------------------------------------------------------------------------------------------
 #   Crash-resilience — checkpoint/resume + instance isolation. NEW (did not exist: only memory-tier
-#   OOM-avoidance existed in limml_dit.h scheduler; render-step resume + multi-instance isolation are new).
+#   OOM-avoidance existed in the native scheduler; render-step resume + multi-instance isolation are new).
 # ---------------------------------------------------------------------------------------------------
 # Diffusion denoise is INHERENTLY checkpointable: the entire state at step s is the latent q_s. So a
 # crash (OOM spike, driver fault) resumes from the last saved latent -> only steps s..N re-run, not 0..N.

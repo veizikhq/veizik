@@ -1411,7 +1411,7 @@ def _stability() -> Dict[str, Any]:
 def contributor_report(hardware: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Data for `veizik telemetry contributor`.
 
-    `hardware` is passed in by the caller (the CLI probes it through limml_universal) so this
+    `hardware` is passed in by the caller (the CLI probes it through veizik_universal) so this
     module stays stdlib-only and never imports the engine.
     """
     st = _state()

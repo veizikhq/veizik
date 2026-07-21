@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""veizik — a ComfyUI DROP-IN CLI powered by the LimML engine (low-VRAM + native-DiT upgrade).
+"""veizik — a ComfyUI DROP-IN CLI with a native inference engine (low-VRAM + native-engine upgrade).
 
-veizik is the customer-facing brand/CLI. LimML is the underlying engine (never renamed). The
-whole point: a user swaps the command (`comfy` -> `veizik`) and it "just works", getting the
-LimML capacity-compute low-VRAM tiering + native-DiT speedups underneath, and the swap is NEVER
-rejected — unknown/unsupported models fall back to a universal path that STILL renders (and, if
-truly opaque, pass through to a real ComfyUI headless run).
+veizik is the customer-facing CLI. The whole point: a user swaps the command (`comfy` -> `veizik`)
+and it "just works", getting low-VRAM execution + native-engine speedups underneath, and the swap
+is NEVER rejected — unknown/unsupported models fall back to a universal path that STILL renders
+(and, if truly opaque, pass through to a real ComfyUI headless run).
 
 The subcommand grammar is a strict SUPERSET of ComfyUI's `comfy`:
     veizik doctor                              # hardware + per-family support tier table
     veizik run    <workflow.json>              # == comfy run    (parse ComfyUI wf -> render)
-    veizik serve  [--port 8188 --listen]       # == comfy launch (ComfyUI + LimML patch injected)
+    veizik serve  [--port 8188 --listen]       # == comfy launch (ComfyUI + veizik patch injected)
     veizik t2v <prompt> [--model .. --w --h --frames --steps]   # direct native text->video
     veizik t2i <prompt> [--model .. --w --h --steps]            # direct native text->image
 
@@ -24,7 +23,7 @@ Add to ~/.bashrc or ~/.zshrc:
     #   ln -sf "$(command -v veizik)" ~/.local/bin/comfy
     #   ln -sf "$(command -v veizik)" ~/.local/bin/vz
 
-`python veizik_cli.py doctor` runs with ONLY stdlib + limml_universal.py in the same dir.
+`python veizik_cli.py doctor` runs with ONLY stdlib + veizik_universal.py in the same dir.
 torch / diffusers / DiffSynth are imported LAZILY, only when an actual render is requested.
 """
 import os, sys, json, argparse, subprocess, time
@@ -50,7 +49,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-BANNER = "veizik (engine: LimML) — ComfyUI-compatible, low-VRAM + native-DiT upgrade"
+BANNER = "veizik — ComfyUI-compatible, low-VRAM + native-engine upgrade"
 
 # families known to the engine, in a stable display order
 _FAMILY_ORDER = ["stepvideo", "ltx", "wan22_moe", "hunyuanvideo", "cogvideox", "flux", "sd35"]
@@ -60,7 +59,7 @@ _FAMILY_ORDER = ["stepvideo", "ltx", "wan22_moe", "hunyuanvideo", "cogvideox", "
 #   lazy engine import (stdlib-only until here)
 # ---------------------------------------------------------------------------------------------------
 def _lu():
-    import limml_universal as lu
+    import veizik_universal as lu
     return lu
 
 
@@ -88,7 +87,7 @@ def _packs():
 #   shared local state + version + honest hardware probe
 #
 #   These back `setup` / `benchmark` / `deactivate` / `update`. Two rules govern everything below:
-#     1. Never invent a number. limml_universal.probe_hardware() FALLS BACK to a synthetic
+#     1. Never invent a number. veizik_universal.probe_hardware() FALLS BACK to a synthetic
 #        "RTX 3090 / 24GB" HwProfile when torch is absent — perfectly fine for planning, fatal for a
 #        benchmark report. So benchmark uses its own probe which records WHERE each value came from
 #        and leaves anything unmeasured explicitly unmeasured.
@@ -834,8 +833,8 @@ def cmd_doctor(args):
     except Exception as e:
         print("\n[gpu oracle] unavailable (%s: %s)" % (type(e).__name__, e))
 
-    print("\n[legend] T1=native LimML CUDA DiT (fastest, verified bit-exact). T2=diffusers/DiffSynth")
-    print("         + LimML capacity-compute offload+tiling+TeaCache. T3=whole-model offload+SDPA,")
+    print("\n[legend] T1=native engine path (block-level numerically verified). T2=diffusers/DiffSynth")
+    print("         + low-VRAM execution. T3=whole-model offload+SDPA,")
     print("         no advanced levers but STILL RENDERS. Any unknown model -> T3 (swap never rejected).")
     print("\n[drop-in] alias comfy=veizik works: `comfy run wf.json` and `comfy launch` are supported.")
     # §14: doctor completed -> if they have never rendered, the next step is a sample command.
@@ -928,7 +927,7 @@ def cmd_run(args):
     print("\n[run] engine plan: family=%s conf=%.2f tier=%s  offload=%s dtype=%s attn=%s teacache=%s"
           % (card.family, card.confidence, plan.support_tier, plan.offload, plan.dtype,
              plan.attention, plan.teacache))
-    print("      render: base=%s frames=%d steps=%d  (LimML capacity-compute tiling=%s)"
+    print("      render: base=%s frames=%d steps=%d  (low-VRAM tiling=%s)"
           % (plan.base_res, plan.frames_native, plan.steps, plan.vae_tiling))
 
     # Decide output path next to the workflow.
@@ -938,7 +937,7 @@ def cmd_run(args):
     # Opaque / no-prompt / no-checkpoint workflow with unusual nodes -> pass through to real ComfyUI.
     opaque = _is_opaque_workflow(intent)
     if opaque and not args.no_passthrough:
-        print("\n[run] workflow uses nodes we don't map to a LimML pipeline (%s).\n"
+        print("\n[run] workflow uses nodes we don't map to a veizik pipeline (%s).\n"
               "      DROP-IN policy: passing through to a real ComfyUI headless run so the swap"
               " still works." % _unmapped_summary(intent))
         rc = _passthrough_comfy_run(wf_path, args)
@@ -1095,7 +1094,7 @@ def _cmd_direct(args, is_video):
 #   render backend dispatch — native (T1) where wired, else diffusers/DiffSynth (T2), else T3 SDPA.
 #   torch/diffusers imported HERE only. On any import/host miss returns a reason string (never raises).
 # ---------------------------------------------------------------------------------------------------
-# family (limml_universal) -> veizik_render.py MODELS key. wan22_moe & stepvideo route to the
+# family (veizik_universal) -> veizik_render.py MODELS key. wan22_moe & stepvideo route to the
 # closest proven real-render config (wan -> Wan2.1 14B; stepvideo has no HF diffusers repo in the
 # render harness -> fall to ltx as the universal video path so the swap STILL renders).
 # stepvideo: real Step-Video 30B binding (DiffSynth low-vram) landed in veizik_render MODELS.
@@ -1134,7 +1133,7 @@ def _do_render(lu, card, plan, prompt, negative, out_path, is_video, seed=None, 
         return "torch unavailable (%s)" % type(e).__name__
 
     # PRIMARY real-render backend: delegate to veizik_render.py — the proven, downloaded-weights
-    # capacity-compute path (LTX ~9.55GB, Step-Video ~44min on one 24GB GPU1, no OOM). It owns the
+    # low-VRAM path (LTX ~9.55GB, Step-Video ~44min on one 24GB GPU1, no OOM). It owns the
     # per-family pipeline loading + offload + VAE tiling and prints OUTPUT_OK <path> <bytes>.
     rc = _delegate_veizik_render(card, plan, prompt, negative, out_path, is_video, seed)
     if rc == 0:
@@ -1145,7 +1144,7 @@ def _do_render(lu, card, plan, prompt, negative, out_path, is_video, seed=None, 
     # SECONDARY: in-process diffusers/DiffSynth bind (needs card._model_dir set to local weights).
     tier = plan.support_tier
     try:
-        if tier == "T1" and card.native_wmma:
+        if tier == "T1" and card.native_engine:
             return _render_native(lu, card, plan, prompt, negative, out_path, is_video, seed)
         return _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed)
     except Exception as e:
@@ -1207,7 +1206,7 @@ def _delegate_veizik_render(card, plan, prompt, negative, out_path, is_video, se
 
 
 def _render_native(lu, card, plan, prompt, negative, out_path, is_video, seed):
-    """T1 native path: use the LimML native DiT engine (liblim_<family>.so via limml_native_bridge)
+    """T1 native path: use the Veizik native DiT engine (liblim_<family>.so via limml_native_bridge)
     for the transformer forward, keeping diffusers/DiffSynth encoders+sampler+VAE. Requires the
     per-host built .so + production-dim weights (see NATIVE_DIT_INLOOP.md 'NEXT'). If the .so isn't
     present we transparently fall back to the diffusers path (still renders, still low-VRAM)."""
@@ -1215,9 +1214,9 @@ def _render_native(lu, card, plan, prompt, negative, out_path, is_video, seed):
                             ("wan" if card.family == "wan22_moe" else card.family))
     if not os.path.exists(so):
         print("[render/native] liblim_%s.so not built on this host -> using diffusers path "
-              "(LimML capacity-compute offload still active)." % card.family)
+              "(Veizik low-VRAM offload still active)." % card.family)
         return _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed)
-    print("[render/native] using LimML native DiT engine: %s (family=%s)" % (so, card.family))
+    print("[render/native] using Veizik native DiT engine: %s (family=%s)" % (so, card.family))
     # The production sampler-hook (swap transformer.forward -> lim_<fam>_forward per denoise step)
     # is the deployment step tracked in NATIVE_DIT_INLOOP.md. Until wired per-host, defer to
     # diffusers with native-informed tiering so output is always produced.
@@ -1225,7 +1224,7 @@ def _render_native(lu, card, plan, prompt, negative, out_path, is_video, seed):
 
 
 def _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed):
-    """T2/T3 universal path via diffusers/DiffSynth with LimML capacity-compute offload + tiling +
+    """T2/T3 universal path via diffusers/DiffSynth with Veizik low-VRAM offload + tiling +
     TeaCache. Builds the pipeline for the detected family; on missing pipeline class -> T3 whole-model
     offload with SDPA (still renders). Returns 0 on a written file, else a reason string."""
     pipe_cls = card.pipeline_cls or ""
@@ -1259,7 +1258,7 @@ def _render_diffusers(lu, card, plan, prompt, negative, out_path, is_video, seed
     except Exception as e:
         return "from_pretrained failed (%s)" % e
 
-    # LimML capacity-compute offload strategy -> map to diffusers knobs.
+    # Veizik low-VRAM offload strategy -> map to diffusers knobs.
     try:
         if plan.offload in ("sequential_cpu_offload",):
             pipe.enable_sequential_cpu_offload()
@@ -1329,7 +1328,7 @@ def _write_plan_sidecar(card, plan, prompt, out_path):
     side = os.path.splitext(out_path)[0] + ".veizik_plan.json"
     try:
         from dataclasses import asdict
-        doc = {"engine": "LimML", "brand": "veizik", "prompt": prompt,
+        doc = {"engine": "Veizik", "brand": "veizik", "prompt": prompt,
                "family": card.family, "confidence": card.confidence,
                "plan": asdict(plan), "out_path": out_path, "ts": time.time()}
         with open(side, "w") as f:
@@ -1340,7 +1339,7 @@ def _write_plan_sidecar(card, plan, prompt, out_path):
 
 
 # ---------------------------------------------------------------------------------------------------
-#   veizik serve  (ComfyUI `comfy launch` / `python main.py` drop-in, LimML patch injected)
+#   veizik serve  (ComfyUI `comfy launch` / `python main.py` drop-in, Veizik patch injected)
 # ---------------------------------------------------------------------------------------------------
 def cmd_serve(args):
     _banner()
@@ -1350,7 +1349,7 @@ def cmd_serve(args):
         print("[serve] ComfyUI main.py not found at %s (set --comfy-dir)" % main_py, file=sys.stderr)
         return 2
 
-    # 1. Install the LimML injection as a ComfyUI custom node (symlink this package in).
+    # 1. Install the Veizik injection as a ComfyUI custom node (symlink this package in).
     _install_custom_node(comfy_dir)
 
     # 2. Launch ComfyUI with the injection env flag + default port 8188 so existing clients work.
@@ -1364,11 +1363,11 @@ def cmd_serve(args):
     if args.extra:
         cmd += args.extra
 
-    print("\n[serve] launching ComfyUI with LimML injection:")
+    print("\n[serve] launching ComfyUI with Veizik injection:")
     print("        %s" % " ".join(cmd))
     print("        port=%d listen=%s  (existing ComfyUI clients/UI keep working unchanged)"
           % (args.port, args.listen))
-    print("        LimML routing engages at ComfyUI startup; look for '[veizik/limml] engaged'.")
+    print("        Veizik routing engages at ComfyUI startup; look for '[veizik/limml] engaged'.")
     if args.dry_run:
         print("[serve] --dry-run: not launching.")
         return 0
@@ -1410,7 +1409,7 @@ def _install_custom_node(comfy_dir):
                 "__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']\n"
                 % _HERE
             )
-        print("[serve] LimML custom node installed -> %s" % nodes_dir)
+        print("[serve] Veizik custom node installed -> %s" % nodes_dir)
     except Exception as e:
         print("[serve] custom-node install warning: %s (ComfyUI still launches; passthrough)" % e)
 
@@ -2386,7 +2385,7 @@ def _pack_tier():
 
 def _pack_reality_note():
     return ("Only configuration packs exist today (profiles, capsules, selection rules).\n"
-            "  The LimML native runtime, advanced kernels and quantization engine are NOT yet\n"
+            "  The Veizik native runtime, advanced kernels and quantization engine are NOT yet\n"
             "  distributable and are in no pack. Render-time figures: measurement in progress.")
 
 
@@ -2622,7 +2621,7 @@ def cmd_pack(args):
         print("[pack] install root     %s" % vp.PACKS_DIR)
         if not inst:
             print("\n[pack] no packs installed. This seat runs the public path only:")
-            print("       the limml_universal autotuner derives a plan from your hardware")
+            print("       the veizik_universal autotuner derives a plan from your hardware")
             print("       on every render, with no stable profile applied.")
             print("\n[pack] see what you can install:  veizik pack list")
             print("\n[pack] %s" % _pack_reality_note())
@@ -2995,7 +2994,7 @@ def cmd_benchmark(args):
         print("  render time     %s for every row — the native engine is not in this download" % _UNMEASURED)
     else:
         print("\n[families] not planned: no measured CUDA GPU on this host. `veizik doctor` will still")
-        print("           print the table, but from limml_universal's DEFAULT profile, not from"
+        print("           print the table, but from veizik_universal's DEFAULT profile, not from"
               " measurement.")
 
     # ---- 3. micro-benchmarks ----------------------------------------------------------------------
@@ -3455,7 +3454,7 @@ def build_parser():
     p_run.add_argument("--comfy-dir", default="~/ComfyUI", help="ComfyUI install dir (for passthrough)")
     p_run.set_defaults(func=cmd_run)
 
-    p_srv = sub.add_parser("serve", help="DROP-IN for `comfy launch`: run ComfyUI + LimML injection")
+    p_srv = sub.add_parser("serve", help="DROP-IN for `comfy launch`: run ComfyUI + Veizik injection")
     p_srv.add_argument("--port", type=int, default=8188, help="port (default 8188, ComfyUI default)")
     p_srv.add_argument("--listen", action="store_true", help="bind 0.0.0.0 (LAN access)")
     p_srv.add_argument("--comfy-dir", default="~/ComfyUI", help="ComfyUI install dir")

@@ -12,7 +12,7 @@ fetch private runtime packs.
     public binary   CLI parser, updater, doctor, license client, telemetry
                     client, PACK LOADER, SIGNATURE VERIFIER, public Adapter
                     interface.                      <- this module lives here
-    private pack    LimML native runtime, advanced kernels, Model Adapters,
+    private pack    Veizik native runtime, advanced kernels, Model Adapters,
                     Capsules, GPU Oracle planner, Recover, TimeMachine, Queue,
                     API bridge.                      <- never in the public binary
 
@@ -1432,7 +1432,7 @@ CREATOR_PACK_FILES: Dict[str, Any] = {
             "profile selection rules (JSON, evaluated by the public loader)",
         ],
         "does_not_contain": [
-            "native LimML runtime",
+            "native Veizik runtime",
             "compiled kernels",
             "model weights",
         ],
@@ -1595,7 +1595,7 @@ def load_profiles() -> Optional[Dict[str, Any]]:
     """Read profiles.json out of any installed pack that provides one.
 
     Returns None when no profile pack is installed — the caller then falls back
-    to the public autotuner in limml_universal, which is what a Free seat runs.
+    to the public autotuner in veizik_universal, which is what a Free seat runs.
     """
     for pack_id in sorted(installed()):
         doc = _read_json(os.path.join(pack_path(pack_id), "profiles.json"))
