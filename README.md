@@ -86,10 +86,11 @@ timings are not yet published.
 **Peak VRAM (internal):** LTX-13B peak VRAM **9.55 GB** on an RTX 3090 (internal). This is a
 VRAM figure, not a render time.
 
-**Block/engine-level numerical checks (internal):** 6 model-family engine paths are
-numerically checked at the block/engine level (rel_L2 ~1e-6..1e-7 vs the reference
-implementation): Step-Video 30B, HunyuanVideo, Wan 2.1, LTX-Video, CogVideoX, and FLUX.1-dev.
-This is a component-level numerical check — **not** an end-to-end generation benchmark.
+**Block/engine-level numerical checks (internal):** engine paths for 6 model families
+(Step-Video 30B, HunyuanVideo, Wan 2.1, LTX-Video, CogVideoX, and FLUX.1-dev) are numerically
+checked at the block/engine level against a reference implementation. This is an internal,
+component-level numerical check — **not** an end-to-end generation benchmark — and no
+numerical-fidelity figure is published here until it is externally reproducible.
 
 **Render time / throughput:** intentionally left blank. Benchmarks are being finalized — see
 [veizik.com](https://veizik.com). No render-time numbers are published in this README until
