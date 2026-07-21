@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """veizik_entitlement — client-side license gate for the veizik CLI.
 
-This is the HONEST paywall layer: it fetches a server-signed entitlement from veizik.com and gates
-features/resolution/watermark by tier. It holds NO signing secret — the secret lives only on the
-Cloudflare Worker (HMAC). The client fetches its entitlement over HTTPS and trusts the payload it
-receives from the real server; it reads the (unencrypted, signed) token body to know the tier. It
-does NOT verify the signature (it can't, and doesn't need to) — TLS + the server is the trust anchor.
+This is the paywall layer: it fetches a server-signed entitlement from veizik.com and gates
+features/resolution/watermark by tier. It holds NO signing secret — only the Cloudflare Worker holds
+the Ed25519 private key. The client PINS the server's Ed25519 public key and VERIFIES the signature on
+every entitlement it loads (fresh or cached). A forged or hand-edited session (e.g. tier set to
+"studio") fails verification and falls back to Free — editing ~/.veizik/session.json no longer grants
+a paid tier. TLS protects the fetch; the pinned signature protects the cache.
 
-Because this is open-source Python, a determined user can patch it; that is expected. This layer is
-the casual-abuse block + honest gate. Cryptographic enforcement (kernel entanglement in the native
-engine) is a separate, deeper layer. Do not oversell this as uncrackable.
+Because this is open-source Python, a determined user can still rebuild the binary to skip this call
+entirely; that is expected. The signature check closes the trivial file-edit bypass, not a full
+recompile. Cryptographic enforcement (kernel entanglement in the native engine) is the deeper layer
+that makes a skipped check yield a non-functional engine. Do not oversell this as uncrackable.
 
 Flow:
     veizik login <api_key>   -> POST /api/entitlement, cache session (~/.veizik/session.json, 0600)
@@ -37,6 +39,63 @@ _FREE = {"tier": "free", "features": ["render", "resume"], "timemachine": False,
          "commercial": False, "watermark": "forced", "exp": 0}
 
 
+
+# --- G1 (client-side signature verification) — pinned server Ed25519 public key + stdlib verify -----
+# The server signs entitlements with Ed25519; the client verifies with THIS pinned public key. A forged
+# or edited session (e.g. hand-set tier=studio) fails verification and is rejected -> Free. Closes the
+# "edit ~/.veizik/session.json -> Studio" bypass. Pure-stdlib RFC 8032 verify (no extra dependency).
+_ENT_PUB_B64 = "IRmlypKFDLsG2V9w45h8BxZ3Xx8eh8ERPIPzNs1Zq9c="   # entitlement_ed25519.pub (raw, 32 bytes)
+
+import hashlib as _hl
+_p = 2**255 - 19
+_d = (-121665 * pow(121666, _p-2, _p)) % _p
+_I = pow(2, (_p-1)//4, _p)
+def _inv(x): return pow(x, _p-2, _p)
+def _xrecover(y):
+    xx = (y*y-1) * _inv(_d*y*y+1)
+    x = pow(xx, (_p+3)//8, _p)
+    if (x*x - xx) % _p != 0: x = (x*_I) % _p
+    if x % 2 != 0: x = _p-x
+    return x
+_By = (4 * _inv(5)) % _p; _Bx = _xrecover(_By); _B = [_Bx % _p, _By % _p]
+def _edwards(P, Q):
+    x1,y1=P; x2,y2=Q
+    x3=(x1*y2+x2*y1)*_inv(1+_d*x1*x2*y1*y2)
+    y3=(y1*y2+x1*x2)*_inv(1-_d*x1*x2*y1*y2)
+    return [x3%_p, y3%_p]
+def _scalarmult(P, e):
+    if e==0: return [0,1]
+    Q=_scalarmult(P, e//2); Q=_edwards(Q,Q)
+    if e&1: Q=_edwards(Q,P)
+    return Q
+def _decodepoint(s):
+    y=int.from_bytes(s,"little") & ((1<<255)-1)
+    x=_xrecover(y)
+    if x & 1 != (s[31]>>7)&1: x=_p-x
+    P=[x,y]
+    if (-P[0]*P[0]+P[1]*P[1]-1-_d*P[0]*P[0]*P[1]*P[1]) % _p != 0: raise ValueError("bad point")
+    return P
+def _ed25519_verify(pubkey, msg, sig):
+    if len(sig)!=64 or len(pubkey)!=32: return False
+    try:
+        A=_decodepoint(pubkey); R=_decodepoint(sig[:32])
+        S=int.from_bytes(sig[32:],"little")
+        h=int.from_bytes(_hl.sha512(sig[:32]+pubkey+msg).digest(),"little")
+        return _scalarmult(_B,S)==_edwards(R,_scalarmult(A,h))
+    except Exception: return False
+
+def _verify_ed25519_token(token):
+    """Return the payload dict ONLY if the token's Ed25519 signature verifies against the pinned key."""
+    try:
+        body, sig = token.split(".", 1)
+        pub = base64.urlsafe_b64decode(_ENT_PUB_B64)
+        s = sig + "=" * (-len(sig) % 4)
+        if not _ed25519_verify(pub, body.encode(), base64.urlsafe_b64decode(s)): return None
+        b = body + "=" * (-len(body) % 4)
+        return json.loads(base64.urlsafe_b64decode(b).decode())
+    except Exception:
+        return None
+
 # ----------------------------------------------------------------------------- transport
 # A real, non-default User-Agent is REQUIRED: Cloudflare's managed rules 403 the stock
 # "Python-urllib/*" UA before the request ever reaches the Worker.
@@ -52,17 +111,6 @@ def _http(method, path, body=None, timeout=20):
         return json.loads(r.read().decode())
 
 
-def _decode_payload(token):
-    """Read the (base64url) body of a signed entitlement token. No signature check — see module doc."""
-    try:
-        body = token.split(".", 1)[0]
-        body += "=" * (-len(body) % 4)
-        return json.loads(base64.urlsafe_b64decode(body).decode())
-    except Exception:
-        return None
-
-
-# ----------------------------------------------------------------------------- session store
 def _load_session():
     try:
         with open(SESSION) as f:
@@ -128,8 +176,12 @@ def login(api_key, ttl=86400):
     resp = _http("POST", "/api/entitlement", {"api_key": api_key, "ttl": ttl})
     if "entitlement" not in resp:
         raise RuntimeError(resp.get("error", "activation failed"))
-    payload = _decode_payload(resp["entitlement"]) or {}
-    _save_session({"api_key": api_key, "token": resp["entitlement"],
+    ed_token = resp.get("entitlement_ed25519")
+    payload = _verify_ed25519_token(ed_token) if ed_token else None
+    if not payload:                                        # missing/invalid signature -> refuse to trust
+        sys.stderr.write("[veizik] entitlement signature did not verify — refusing (are you on the latest client?)\n")
+        raise RuntimeError("entitlement signature verification failed")
+    _save_session({"api_key": api_key, "token": ed_token,
                    "payload": payload, "fetched_at": int(time.time())})
     return Entitlement(payload, "live")
 
@@ -147,7 +199,9 @@ def resolve(quiet=False):
     sess = _load_session()
     if not sess:
         return Entitlement(dict(_FREE), "free")
-    payload = sess.get("payload") or {}
+    payload = _verify_ed25519_token(sess.get("token") or "") or {}   # re-verify cached token every load
+    if not payload:
+        return Entitlement(dict(_FREE), "free")            # tampered/forged cache -> Free
     now = int(time.time())
     exp = int(payload.get("exp", 0) or 0)
     if now < exp:
