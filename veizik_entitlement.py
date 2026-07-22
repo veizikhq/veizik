@@ -30,7 +30,7 @@ _MAX_SKEW_S     = 300                # clock-skew tolerance for nbf / anti-rollb
 _OUTAGE_MAX_AGE = 300                # oracle attestation must be < 5 min old (anti-replay)
 # Liveness oracle public key (key #2, low-value: can ONLY sign outage attestations, never a tier/exp).
 # Empty until the oracle is stood up -> the oracle branch is skipped and grace stays SHORT (safe default).
-_LIVE_PUB_B64   = os.environ.get("VEIZIK_LIVE_PUB", "T-uNg4_s5ITyzazWfAoceipk_CO67yRPe_vL3gh5_b8")
+_LIVE_PUB_B64   = os.environ.get("VEIZIK_LIVE_PUB", "YOfMYK0kxVyWVGPGo7KrwEutCB_Tgj9KFfbGvyCxE8w")
 _HWM = SESSION + ".hwm"              # tamper-evident anti-rollback anchor sidecar
 
 # Free-tier / entry caps (paid creator+ = uncapped). Mirrors the pricing plan (Free = 720p/~5s).
