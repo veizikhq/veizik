@@ -171,18 +171,20 @@ def _save_session(sess):
 def _hwm_key(sess):                                   # keyed off the server-signed token; rotates per login
     return _hl.sha256(("vzk-hwm|" + (sess.get("token") or "")).encode()).digest()
 
+_HWM_FIELDS = ("hwm", "grace_used", "grace_src", "a_wall", "a_mono")
+
 def _load_hwm(sess):
     try:
         d = json.load(open(_HWM))
-        body = json.dumps({k: d[k] for k in ("hwm", "grace_used", "grace_src")}, sort_keys=True).encode()
+        body = json.dumps({k: d.get(k) for k in _HWM_FIELDS}, sort_keys=True).encode()
         if _hmac.compare_digest(d.get("mac", ""), _hmac.new(_hwm_key(sess), body, _hl.sha256).hexdigest()):
             return d
     except Exception:
         pass
-    return {"hwm": 0, "grace_used": False, "grace_src": None}
+    return {"hwm": 0, "grace_used": False, "grace_src": None, "a_wall": None, "a_mono": None}
 
 def _save_hwm(sess, d):
-    body = json.dumps({k: d[k] for k in ("hwm", "grace_used", "grace_src")}, sort_keys=True).encode()
+    body = json.dumps({k: d.get(k) for k in _HWM_FIELDS}, sort_keys=True).encode()
     d["mac"] = _hmac.new(_hwm_key(sess), body, _hl.sha256).hexdigest()
     try:
         os.makedirs(os.path.dirname(_HWM), exist_ok=True)
@@ -191,6 +193,27 @@ def _save_hwm(sess, d):
         os.replace(tmp, _HWM); os.chmod(_HWM, 0o600)
     except OSError:
         pass
+
+def _effective_now(h):
+    """Wall-clock time, but FLOORED by real elapsed measured with time.monotonic(). A `date`-based
+    freeze or rollback stops the wall clock, but monotonic keeps advancing (it is not settable), so the
+    token still ages on real schedule. `max(wall, derived)` only ever moves time FORWARD, so a legit
+    machine (whose wall clock is fine) and a suspended laptop (wall jumps ahead, safe direction) are
+    never falsely penalized — only a frozen/rolled-back clock is corrected. A root user who also hooks
+    time.monotonic() (LD_PRELOAD / VM) defeats this; the server beacon + engine seat-lease catch that."""
+    wall = int(time.time())
+    try:
+        mono = time.monotonic()
+    except Exception:
+        return max(wall, int(h.get("hwm", 0)))               # no monotonic -> fall back to wall/hwm
+    a_wall, a_mono = h.get("a_wall"), h.get("a_mono")
+    if a_wall is not None and a_mono is not None and mono >= a_mono:
+        derived = int(a_wall + (mono - a_mono))              # real seconds elapsed since anchor (this boot)
+        eff = max(wall, derived, int(h.get("hwm", 0)))
+    else:
+        eff = max(wall, int(h.get("hwm", 0)))                # first run or reboot (monotonic reset) -> re-anchor
+    h["hwm"] = eff; h["a_wall"] = eff; h["a_mono"] = mono     # ratchet the anchor forward
+    return eff
 
 def _oracle_confirms_outage(timeout=6):
     """True ONLY if the independent oracle is reachable, its attestation verifies against the pinned
@@ -295,14 +318,12 @@ def resolve(quiet=False):
         payload = _verify_ed25519_token(sess.get("token") or "")
         if not payload or not _device_ok(payload):
             return Entitlement(dict(_FREE), "free")        # tampered/forged/future-dated/other-device -> Free
-        now = int(time.time())
         exp = int(payload.get("exp", 0) or 0)
         iat = int(payload.get("iat", 0) or 0)
         h = _load_hwm(sess)
-        hwm = max(int(h.get("hwm", 0)), iat)               # signed monotonic time floor
-        rolled = now < hwm - _MAX_SKEW_S                   # casual clock rollback detected
-        if not rolled and now > hwm:
-            h["hwm"] = hwm = now; _save_hwm(sess, h)
+        now = max(_effective_now(h), iat)                  # monotonic-floored wall + signed issue-time floor
+        rolled = int(time.time()) < now - _MAX_SKEW_S      # raw wall behind the monotonic/signed floor -> frozen/rolled
+        _save_hwm(sess, h)                                 # persist the ratcheted monotonic anchor
 
         if not rolled and 0 < exp and now < exp:
             return Entitlement(payload, "cached")          # signed, unexpired -> offline OK up to 24h
