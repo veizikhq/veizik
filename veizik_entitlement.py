@@ -19,11 +19,19 @@ Flow:
     veizik logout            -> drop the session
     (render commands)        -> resolve() gates features, clamps free-tier res/frames, stamps output
 """
-import os, sys, json, time, base64, urllib.request, urllib.error
+import os, sys, json, time, base64, hmac as _hmac, urllib.request, urllib.error
 
 API_BASE = os.environ.get("VEIZIK_API_BASE", "https://veizik.com").rstrip("/")
+STATUS_BASE = os.environ.get("VEIZIK_STATUS_BASE", "https://veizik-status.deno.dev").rstrip("/")
 SESSION = os.path.expanduser(os.environ.get("VEIZIK_SESSION", "~/.veizik/session.json"))
-OFFLINE_GRACE_S = 72 * 3600          # keep last-known tier this long past expiry when offline
+SHORT_GRACE_S   = 24 * 3600          # offline / outage-UNCONFIRMED -> bounds a deliberately-offline user
+OUTAGE_GRACE_S  = 14 * 24 * 3600     # oracle-CONFIRMED global primary outage -> keep honest users working
+_MAX_SKEW_S     = 300                # clock-skew tolerance for nbf / anti-rollback high-water-mark
+_OUTAGE_MAX_AGE = 300                # oracle attestation must be < 5 min old (anti-replay)
+# Liveness oracle public key (key #2, low-value: can ONLY sign outage attestations, never a tier/exp).
+# Empty until the oracle is stood up -> the oracle branch is skipped and grace stays SHORT (safe default).
+_LIVE_PUB_B64   = os.environ.get("VEIZIK_LIVE_PUB", "")
+_HWM = SESSION + ".hwm"              # tamper-evident anti-rollback anchor sidecar
 
 # Free-tier / entry caps (paid creator+ = uncapped). Mirrors the pricing plan (Free = 720p/~5s).
 CAPS = {
@@ -84,17 +92,45 @@ def _ed25519_verify(pubkey, msg, sig):
         return _scalarmult(_B,S)==_edwards(R,_scalarmult(A,h))
     except Exception: return False
 
-def _verify_ed25519_token(token):
-    """Return the payload dict ONLY if the token's Ed25519 signature verifies against the pinned key."""
+def _verify_token(token, pub_b64=_ENT_PUB_B64):
+    """Return the signed payload ONLY if its Ed25519 signature verifies against `pub_b64`.
+    Also enforces `nbf` (not-before): a token dated in the future (or a rolled-back local clock)
+    is rejected. `nbf` is nbf-tolerant — absent => 0 => always valid — so the client can ship
+    before the server guarantees the field."""
     try:
         body, sig = token.split(".", 1)
-        pub = base64.urlsafe_b64decode(_ENT_PUB_B64)
+        pub = base64.urlsafe_b64decode(pub_b64)
         s = sig + "=" * (-len(sig) % 4)
         if not _ed25519_verify(pub, body.encode(), base64.urlsafe_b64decode(s)): return None
         b = body + "=" * (-len(body) % 4)
-        return json.loads(base64.urlsafe_b64decode(b).decode())
+        p = json.loads(base64.urlsafe_b64decode(b).decode())
+        nbf = int(p.get("nbf", 0) or 0)
+        if nbf and int(time.time()) + _MAX_SKEW_S < nbf: return None   # future-dated / rolled-back clock
+        return p
     except Exception:
         return None
+
+def _verify_ed25519_token(token):
+    """Backward-compatible alias (verifies against the pinned ENTITLEMENT key)."""
+    return _verify_token(token, _ENT_PUB_B64)
+
+
+# --- device binding (closes cross-device token theft/replay) -----------------------------------------
+def device_fingerprint():
+    """Stable HWID (soft signals; prod prefers a TPM/Secure-Enclave attested key)."""
+    import platform, uuid
+    sig = "|".join([platform.node(), platform.machine(), platform.system(),
+                    hex(uuid.getnode()), os.environ.get("VZ_GPU_UUID", "")])
+    return _hl.sha256(sig.encode()).digest()
+
+def _dev_hex():
+    return device_fingerprint().hex()
+
+def _device_ok(payload):
+    """True if the token is NOT device-bound (rollout-tolerant) OR is bound to THIS device.
+    A captured token replayed on another machine carries someone else's `device` -> rejected -> Free."""
+    d = payload.get("device")
+    return (not d) or (d == _dev_hex())
 
 # ----------------------------------------------------------------------------- transport
 # A real, non-default User-Agent is REQUIRED: Cloudflare's managed rules 403 the stock
@@ -129,6 +165,52 @@ def _save_session(sess):
         os.chmod(SESSION, 0o600)
     except OSError:
         pass
+
+
+# --- anti-rollback anchor + liveness oracle (backup + intentional-offline defense) ------------------
+def _hwm_key(sess):                                   # keyed off the server-signed token; rotates per login
+    return _hl.sha256(("vzk-hwm|" + (sess.get("token") or "")).encode()).digest()
+
+def _load_hwm(sess):
+    try:
+        d = json.load(open(_HWM))
+        body = json.dumps({k: d[k] for k in ("hwm", "grace_used", "grace_src")}, sort_keys=True).encode()
+        if _hmac.compare_digest(d.get("mac", ""), _hmac.new(_hwm_key(sess), body, _hl.sha256).hexdigest()):
+            return d
+    except Exception:
+        pass
+    return {"hwm": 0, "grace_used": False, "grace_src": None}
+
+def _save_hwm(sess, d):
+    body = json.dumps({k: d[k] for k in ("hwm", "grace_used", "grace_src")}, sort_keys=True).encode()
+    d["mac"] = _hmac.new(_hwm_key(sess), body, _hl.sha256).hexdigest()
+    try:
+        os.makedirs(os.path.dirname(_HWM), exist_ok=True)
+        tmp = _HWM + ".tmp"
+        with open(tmp, "w") as f: f.write(json.dumps(d))
+        os.replace(tmp, _HWM); os.chmod(_HWM, 0o600)
+    except OSError:
+        pass
+
+def _oracle_confirms_outage(timeout=6):
+    """True ONLY if the independent oracle is reachable, its attestation verifies against the pinned
+    liveness key, is fresh (<5min), and reports the primary genuinely down. A user who merely blocks
+    veizik.com locally cannot trigger this: the oracle probes the primary SERVER-SIDE."""
+    if not _LIVE_PUB_B64 or not STATUS_BASE:
+        return (False, 0)                                    # oracle not configured yet -> SHORT grace only
+    try:
+        req = urllib.request.Request(STATUS_BASE + "/live", headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            att = json.loads(r.read().decode()).get("attestation", "")
+        p = _verify_token(att, _LIVE_PUB_B64)
+        if not p:
+            return (False, 0)
+        ca = int(p.get("checked_at", 0) or 0)
+        if int(time.time()) - ca > _OUTAGE_MAX_AGE:          # stale attestation -> reject (anti-replay)
+            return (False, ca)
+        return (bool(p.get("primary_down")), ca)
+    except Exception:
+        return (False, 0)
 
 
 # ----------------------------------------------------------------------------- entitlement model
@@ -173,7 +255,8 @@ def login(api_key, ttl=86400):
     api_key = (api_key or "").strip()
     if not api_key:
         raise ValueError("empty api key")
-    resp = _http("POST", "/api/entitlement", {"api_key": api_key, "ttl": ttl})
+    resp = _http("POST", "/api/entitlement",
+                 {"api_key": api_key, "ttl": ttl, "device_fp": base64.b64encode(device_fingerprint()).decode()})
     if "entitlement" not in resp:
         raise RuntimeError(resp.get("error", "activation failed"))
     ed_token = resp.get("entitlement_ed25519")
@@ -181,8 +264,15 @@ def login(api_key, ttl=86400):
     if not payload:                                        # missing/invalid signature -> refuse to trust
         sys.stderr.write("[veizik] entitlement signature did not verify — refusing (are you on the latest client?)\n")
         raise RuntimeError("entitlement signature verification failed")
-    _save_session({"api_key": api_key, "token": ed_token,
-                   "payload": payload, "fetched_at": int(time.time())})
+    if not _device_ok(payload):                            # bound to a different device -> refuse
+        sys.stderr.write("[veizik] entitlement is bound to a different device — refusing\n")
+        raise RuntimeError("entitlement device mismatch")
+    sess = {"api_key": api_key, "token": ed_token, "payload": payload, "fetched_at": int(time.time())}
+    _save_session(sess)
+    h = _load_hwm(sess)                                       # a fresh live token is the ONLY thing that
+    h["hwm"] = max(int(h.get("hwm", 0)), int(payload.get("iat", 0) or 0), int(time.time()))
+    h["grace_used"] = False; h["grace_src"] = None           # ...resets the one-shot SHORT_GRACE budget
+    _save_hwm(sess, h)
     return Entitlement(payload, "live")
 
 
@@ -195,31 +285,59 @@ def logout():
 
 
 def resolve(quiet=False):
-    """Return the active Entitlement: refresh if expired, fall back to cached (offline grace) or free."""
-    sess = _load_session()
-    if not sess:
-        return Entitlement(dict(_FREE), "free")
-    payload = _verify_ed25519_token(sess.get("token") or "") or {}   # re-verify cached token every load
-    if not payload:
-        return Entitlement(dict(_FREE), "free")            # tampered/forged cache -> Free
-    now = int(time.time())
-    exp = int(payload.get("exp", 0) or 0)
-    if now < exp:
-        return Entitlement(payload, "cached")          # still valid, no network needed
-    # expired -> try to refresh with the stored key
+    """Active Entitlement: signed+unexpired -> cached; expired -> live refresh; refresh-fails ->
+    graded grace (one-shot 24h when merely offline, up to 14d only during an ORACLE-CONFIRMED global
+    outage); revoked -> Free immediately; rolled-back clock -> Free. NEVER raises, NEVER blocks render."""
     try:
-        return login(sess["api_key"])                  # writes a fresh session, source='live'
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
-        if now < exp + OFFLINE_GRACE_S:                # offline: honor last-known tier during grace
-            if not quiet:
-                sys.stderr.write("[veizik] offline — using cached %s entitlement (grace)\n"
-                                 % payload.get("tier", "free"))
-            return Entitlement(payload, "grace")
+        sess = _load_session()
+        if not sess:
+            return Entitlement(dict(_FREE), "free")
+        payload = _verify_ed25519_token(sess.get("token") or "")
+        if not payload or not _device_ok(payload):
+            return Entitlement(dict(_FREE), "free")        # tampered/forged/future-dated/other-device -> Free
+        now = int(time.time())
+        exp = int(payload.get("exp", 0) or 0)
+        iat = int(payload.get("iat", 0) or 0)
+        h = _load_hwm(sess)
+        hwm = max(int(h.get("hwm", 0)), iat)               # signed monotonic time floor
+        rolled = now < hwm - _MAX_SKEW_S                   # casual clock rollback detected
+        if not rolled and now > hwm:
+            h["hwm"] = hwm = now; _save_hwm(sess, h)
+
+        if not rolled and 0 < exp and now < exp:
+            return Entitlement(payload, "cached")          # signed, unexpired -> offline OK up to 24h
+
+        # expired OR rollback-forced -> attempt a live refresh against the single primary issuer
+        try:
+            return login(sess["api_key"])                  # writes fresh session, source='live'
+        except urllib.error.HTTPError as e:
+            if getattr(e, "code", None) in (401, 402, 403):    # server said NO (revoked/invalid)
+                return Entitlement(dict(_FREE), "free")        #   -> Free NOW, zero grace
+            # 5xx / 429 / 52x -> treat as an outage below
+        except (urllib.error.URLError, OSError, TimeoutError, RuntimeError, ValueError):
+            pass                                               # unreachable / bad response -> outage path
+
+        if rolled:                                             # rolled-back clock earns NO grace
+            return Entitlement(dict(_FREE), "free")
+        confirmed, _ = _oracle_confirms_outage()
+        if confirmed:
+            if now < exp + OUTAGE_GRACE_S:                     # oracle-confirmed global outage -> long window
+                if not quiet:
+                    sys.stderr.write("[veizik] confirmed primary outage — extended grace (%s)\n"
+                                     % payload.get("tier", "free"))
+                return Entitlement(payload, "grace")
+        else:
+            if now < exp + SHORT_GRACE_S and not h.get("grace_used"):   # merely offline -> one-shot 24h
+                h["grace_used"] = True; h["grace_src"] = "short"; _save_hwm(sess, h)
+                if not quiet:
+                    sys.stderr.write("[veizik] offline — one-time %dh grace (%s)\n"
+                                     % (SHORT_GRACE_S // 3600, payload.get("tier", "free")))
+                return Entitlement(payload, "grace")
+        if not quiet:
+            sys.stderr.write("[veizik] entitlement expired and could not refresh — falling back to Free\n")
+        return Entitlement(dict(_FREE), "free")
     except Exception:
-        pass
-    if not quiet:
-        sys.stderr.write("[veizik] entitlement expired and could not refresh — falling back to Free\n")
-    return Entitlement(dict(_FREE), "free")
+        return Entitlement(dict(_FREE), "free")            # HARD INVARIANT: resolve() never raises
 
 
 # ----------------------------------------------------------------------------- watermarking
