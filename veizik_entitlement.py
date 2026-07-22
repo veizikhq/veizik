@@ -30,7 +30,7 @@ _MAX_SKEW_S     = 300                # clock-skew tolerance for nbf / anti-rollb
 _OUTAGE_MAX_AGE = 300                # oracle attestation must be < 5 min old (anti-replay)
 # Liveness oracle public key (key #2, low-value: can ONLY sign outage attestations, never a tier/exp).
 # Empty until the oracle is stood up -> the oracle branch is skipped and grace stays SHORT (safe default).
-_LIVE_PUB_B64   = os.environ.get("VEIZIK_LIVE_PUB", "")
+_LIVE_PUB_B64   = os.environ.get("VEIZIK_LIVE_PUB", "T-uNg4_s5ITyzazWfAoceipk_CO67yRPe_vL3gh5_b8")
 _HWM = SESSION + ".hwm"              # tamper-evident anti-rollback anchor sidecar
 
 # Free-tier / entry caps (paid creator+ = uncapped). Mirrors the pricing plan (Free = 720p/~5s).
@@ -99,7 +99,7 @@ def _verify_token(token, pub_b64=_ENT_PUB_B64):
     before the server guarantees the field."""
     try:
         body, sig = token.split(".", 1)
-        pub = base64.urlsafe_b64decode(pub_b64)
+        pub = base64.urlsafe_b64decode(pub_b64 + "=" * (-len(pub_b64) % 4))   # padding-tolerant
         s = sig + "=" * (-len(sig) % 4)
         if not _ed25519_verify(pub, body.encode(), base64.urlsafe_b64decode(s)): return None
         b = body + "=" * (-len(body) % 4)
